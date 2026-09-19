@@ -12,6 +12,8 @@ public class RTPAudioSender {
     private long timestamp = 0;
     private int ssrc;
     private long startTime;
+    /** 已成功发出的 RTP 包数（用于判断音频是否真的在发送） */
+    private volatile long packetsSent = 0;
 
     /**
      * 复用外部已有 socket（一般是 RTPAudioReceiver 的），
@@ -54,6 +56,7 @@ public class RTPAudioSender {
             );
 
             socket.send(packet);
+            packetsSent++;
 
             sequenceNumber++;
             if (sequenceNumber > 65535) {
@@ -90,6 +93,11 @@ public class RTPAudioSender {
         buffer.put(payload);
 
         return buffer.array();
+    }
+
+    /** 已成功发出的 RTP 包数 */
+    public long getPacketsSent() {
+        return packetsSent;
     }
 
     public void close() {

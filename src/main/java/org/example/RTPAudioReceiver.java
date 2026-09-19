@@ -8,6 +8,8 @@ public class RTPAudioReceiver {
     private SourceDataLine speaker;
     private boolean isRunning = false;
     private AudioFormat format;
+    /** 已收到的 RTP 包数（用于判断音频是否真的在接收） */
+    private volatile long packetsReceived = 0;
 
     public RTPAudioReceiver(int localPort) throws Exception {
         socket = new DatagramSocket(localPort);
@@ -30,6 +32,11 @@ public class RTPAudioReceiver {
         return socket;
     }
 
+    /** 已收到的 RTP 包数 */
+    public long getPacketsReceived() {
+        return packetsReceived;
+    }
+
     public void start() {
         isRunning = true;
 
@@ -50,6 +57,13 @@ public class RTPAudioReceiver {
 
                     if (packetLength < 12) {
                         continue; // RTP头至少12字节
+                    }
+
+                    packetsReceived++;
+                    if (packetsReceived == 1) {
+                        System.out.println("✓ 收到第一个 RTP 包，来自 "
+                                + packet.getAddress().getHostAddress() + ":" + packet.getPort()
+                                + "，长度 " + packetLength + " 字节");
                     }
 
                     // RTP头长度

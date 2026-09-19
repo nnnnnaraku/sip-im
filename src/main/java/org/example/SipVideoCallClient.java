@@ -4,11 +4,19 @@ import javax.sip.*;
 import javax.sip.address.*;
 import javax.sip.header.*;
 import javax.sip.message.*;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.*;
 import java.util.regex.*;
 
 public class SipVideoCallClient implements SipListener {
+
+    /** 配置来源：项目根目录的 config.properties；不存在则全部使用内置默认值 */
+    private static final Properties CONFIG = loadConfig();
 
     private SipStack sipStack;
     private SipProvider sipProvider;
@@ -17,15 +25,18 @@ public class SipVideoCallClient implements SipListener {
     private MessageFactory messageFactory;
     private ListeningPoint listeningPoint;
 
-    // 配置信息
-    private String username = "100";
-    private String password = "100";
-    private String serverIp = "10.122.213.68";
-    private int serverPort = 5060;
-    private String localIp = "10.122.213.68";
-    private int localPort = 5061;
+    // 配置信息：优先读 config.properties，未配置项用默认值
+    private String username   = cfg("sip.username",     "100");
+    private String password   = cfg("sip.password",     "100");
+    private String serverIp   = cfg("sip.server.ip",    "10.122.213.68");
+    private int    serverPort = intCfg("sip.server.port", 5060);
+    private String localIp    = cfg("sip.local.ip",     "10.122.213.68");
+    private int    localPort  = intCfg("sip.local.port",  5061);
 
-    private String targetUser = "101";
+    private String targetUser = cfg("sip.target.user",  "101");
+
+    /** 通话时长（秒），到时自动挂断 */
+    private static final int CALL_DURATION_SEC = intCfg("call.duration.sec", 180);
 
     private Dialog dialog;
     private ClientTransaction inviteTransaction;
@@ -36,9 +47,45 @@ public class SipVideoCallClient implements SipListener {
     private RTPAudioSender rtpSender;
     private RTPAudioReceiver rtpReceiver;
 
-    private int localAudioPort = 8000;
+    private int localAudioPort = intCfg("media.local.port", 8000);
     private String remoteAudioIp;
     private int remoteAudioPort;
+
+    // ---------- 配置加载 ----------
+
+    /** 读取项目根目录下的 config.properties（不存在则全部用默认值） */
+    private static Properties loadConfig() {
+        Properties p = new Properties();
+        File f = new File("config.properties");
+        if (!f.exists()) {
+            System.out.println("未找到 config.properties，使用内置默认配置");
+            return p;
+        }
+        try (InputStream in = new FileInputStream(f);
+             InputStreamReader r = new InputStreamReader(in, StandardCharsets.UTF_8)) {
+            p.load(r);
+            System.out.println("已加载配置文件: " + f.getAbsolutePath());
+        } catch (Exception e) {
+            System.err.println("读取 config.properties 失败，改用默认配置: " + e.getMessage());
+        }
+        return p;
+    }
+
+    private static String cfg(String key, String def) {
+        String v = CONFIG.getProperty(key);
+        return (v == null || v.trim().isEmpty()) ? def : v.trim();
+    }
+
+    private static int intCfg(String key, int def) {
+        String v = CONFIG.getProperty(key);
+        if (v == null || v.trim().isEmpty()) return def;
+        try {
+            return Integer.parseInt(v.trim());
+        } catch (NumberFormatException e) {
+            System.err.println("配置项 " + key + " 不是合法整数，使用默认值 " + def);
+            return def;
+        }
+    }
 
     public static void main(String[] args) {
         try {
@@ -55,8 +102,8 @@ public class SipVideoCallClient implements SipListener {
                 System.out.println("注册失败，无法发起呼叫");
             }
 
-            // 保持程序运行
-            Thread.sleep(300000);
+            // 保持程序运行：等通话（含自动挂断）结束后再退出
+            Thread.sleep((CALL_DURATION_SEC + 60) * 1000L);
 
             client.shutdown();
 
@@ -102,8 +149,10 @@ public class SipVideoCallClient implements SipListener {
         sipProvider.addSipListener(this);
 
         System.out.println("SIP客户端初始化完成");
+        System.out.println("本机账号: " + username + "    被叫账号: " + targetUser);
         System.out.println("本地地址: " + localIp + ":" + localPort);
         System.out.println("服务器地址: " + serverIp + ":" + serverPort);
+        System.out.println("自动挂断: " + CALL_DURATION_SEC + " 秒");
 
         // 注册
         register();
@@ -419,6 +468,20 @@ public class SipVideoCallClient implements SipListener {
     private void stopMedia() {
         System.out.println("\n停止音频流...");
 
+        // 先打印收发统计：用于判断音频是否真的双向流动（不依赖人耳）
+        long sent = (rtpSender != null) ? rtpSender.getPacketsSent() : 0;
+        long recv = (rtpReceiver != null) ? rtpReceiver.getPacketsReceived() : 0;
+        System.out.println("=== RTP 收发统计 ===");
+        System.out.println("  已发送音频包: " + sent);
+        System.out.println("  已接收音频包: " + recv);
+        if (recv == 0) {
+            System.out.println("  !! 未收到任何音频包 —— 对端到你方向不通");
+        } else if (sent == 0) {
+            System.out.println("  !! 未发送任何音频包 —— 麦克风可能没采集到数据");
+        } else {
+            System.out.println("  OK 双向都有音频包，媒体通道正常");
+        }
+
         if (audioCapture != null) {
             audioCapture.stop();
         }
@@ -544,11 +607,11 @@ public class SipVideoCallClient implements SipListener {
                         startMedia(remoteSdp);
                     }
 
-                    // 60秒后自动挂断
+                    // 达到设定通话时长后自动挂断
                     new Thread(() -> {
                         try {
-                            Thread.sleep(60000);
-                            System.out.println("\n60秒测试时间到，挂断电话...");
+                            Thread.sleep(CALL_DURATION_SEC * 1000L);
+                            System.out.println("\n通话达到 " + CALL_DURATION_SEC + " 秒，自动挂断...");
                             hangup();
                         } catch (Exception e) {
                             e.printStackTrace();

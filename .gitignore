@@ -10,6 +10,9 @@ sipDebug.txt
 sipServer.txt
 *.log
 
+# ---- 本地配置（各机器不同，不入库；模板见 config.properties.example） ----
+config.properties
+
 # ---- IDE ----
 .idea/
 *.iml
