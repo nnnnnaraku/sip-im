@@ -58,6 +58,24 @@ public class SipVideoCallClient implements SipListener {
             // 保持程序运行
             Thread.sleep(300000);
 
+            client.shutdown();
+
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+
+        // JAIN SIP 的定时器/事件线程是非守护线程，若不显式退出，
+        // 进程会一直存活、占用本地端口，导致下次启动 BindException
+        System.exit(0);
+    }
+
+    /** 停止媒体流并关闭 SIP 协议栈，释放本地端口 */
+    public void shutdown() {
+        try {
+            stopMedia();
+            if (sipStack != null) {
+                sipStack.stop();
+            }
         } catch (Exception e) {
             e.printStackTrace();
         }
@@ -70,7 +88,7 @@ public class SipVideoCallClient implements SipListener {
         Properties properties = new Properties();
         properties.setProperty("javax.sip.STACK_NAME", "SipClient100");
         properties.setProperty("javax.sip.IP_ADDRESS", localIp);
-        properties.setProperty("gov.nist.javax.sip.TRACE_LEVEL", "32");
+        properties.setProperty("gov.nist.javax.sip.TRACE_LEVEL", "16");
         properties.setProperty("gov.nist.javax.sip.DEBUG_LOG", "sipDebug.txt");
         properties.setProperty("gov.nist.javax.sip.SERVER_LOG", "sipServer.txt");
 
@@ -351,12 +369,13 @@ public class SipVideoCallClient implements SipListener {
             System.out.println("本地音频端口: " + localAudioPort);
             System.out.println("远程音频地址: " + remoteAudioIp + ":" + remoteAudioPort);
 
-            // 启动RTP接收器
+            // 启动RTP接收器（绑定 localAudioPort，该端口已在上述 SDP 中宣告）
             rtpReceiver = new RTPAudioReceiver(localAudioPort);
             rtpReceiver.start();
 
-            // 启动RTP发送器
-            rtpSender = new RTPAudioSender(localAudioPort + 1);
+            // 启动RTP发送器：复用接收器的同一个 socket，保证「收发同端口」。
+            // 若用独立端口发送，对端做对称 RTP 校验时会丢弃数据包，导致单向/无音频。
+            rtpSender = new RTPAudioSender(rtpReceiver.getSocket());
             rtpSender.setRemote(remoteAudioIp, remoteAudioPort);
 
             // 启动音频采集

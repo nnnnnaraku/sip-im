@@ -25,6 +25,11 @@ public class RTPAudioReceiver {
         System.out.println("  格式: " + format);
     }
 
+    /** 供 RTPAudioSender 复用，实现 RTP 收发共用一个本地端口 */
+    public DatagramSocket getSocket() {
+        return socket;
+    }
+
     public void start() {
         isRunning = true;
 

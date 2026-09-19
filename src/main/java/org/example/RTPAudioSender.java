@@ -5,6 +5,7 @@ import java.nio.ByteBuffer;
 
 public class RTPAudioSender {
     private DatagramSocket socket;
+    private boolean ownsSocket;
     private InetAddress remoteAddress;
     private int remotePort;
     private int sequenceNumber = 0;
@@ -12,8 +13,21 @@ public class RTPAudioSender {
     private int ssrc;
     private long startTime;
 
+    /**
+     * 复用外部已有 socket（一般是 RTPAudioReceiver 的），
+     * 使 RTP 收发共用同一个本地端口，满足对称 RTP 要求。
+     */
+    public RTPAudioSender(DatagramSocket sharedSocket) {
+        this.socket = sharedSocket;
+        this.ownsSocket = false;
+        ssrc = (int) (Math.random() * Integer.MAX_VALUE);
+        startTime = System.currentTimeMillis();
+        System.out.println("RTP发送器已创建，复用本地端口: " + sharedSocket.getLocalPort());
+    }
+
     public RTPAudioSender(int localPort) throws SocketException {
         socket = new DatagramSocket(localPort);
+        ownsSocket = true;
         ssrc = (int) (Math.random() * Integer.MAX_VALUE);
         startTime = System.currentTimeMillis();
         System.out.println("RTP发送器已创建，本地端口: " + localPort);
@@ -79,7 +93,8 @@ public class RTPAudioSender {
     }
 
     public void close() {
-        if (socket != null && !socket.isClosed()) {
+        // 共享 socket 由接收器负责关闭；这里若抢先关闭，接收线程会抛异常
+        if (ownsSocket && socket != null && !socket.isClosed()) {
             socket.close();
         }
     }
