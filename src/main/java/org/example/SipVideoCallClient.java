@@ -38,9 +38,15 @@ public class SipVideoCallClient implements SipListener {
     /** 通话时长（秒），到时自动挂断 */
     private static final int CALL_DURATION_SEC = intCfg("call.duration.sec", 180);
 
+    /** 启动后是否自动呼叫被叫（测文字消息时建议设为 false） */
+    private static final boolean AUTO_INVITE = boolCfg("call.auto.invite", true);
+
     private Dialog dialog;
     private ClientTransaction inviteTransaction;
     private boolean isRegistered = false;
+
+    /** 文字消息的 CSeq 序号，每发一条递增 */
+    private long messageCSeq = 1;
 
     // 媒体组件
     private AudioCapture audioCapture;
@@ -87,6 +93,12 @@ public class SipVideoCallClient implements SipListener {
         }
     }
 
+    private static boolean boolCfg(String key, boolean def) {
+        String v = CONFIG.getProperty(key);
+        if (v == null || v.trim().isEmpty()) return def;
+        return Boolean.parseBoolean(v.trim());
+    }
+
     public static void main(String[] args) {
         try {
             SipVideoCallClient client = new SipVideoCallClient();
@@ -96,8 +108,13 @@ public class SipVideoCallClient implements SipListener {
             Thread.sleep(3000);
 
             if (client.isRegistered) {
-                System.out.println("\n开始呼叫用户 " + client.targetUser + "...");
-                client.makeCall();
+                if (AUTO_INVITE) {
+                    System.out.println("\n开始呼叫用户 " + client.targetUser + "...");
+                    client.makeCall();
+                } else {
+                    System.out.println("\n已关闭自动呼叫（call.auto.invite=false）");
+                }
+                client.startChat();
             } else {
                 System.out.println("注册失败，无法发起呼叫");
             }
@@ -546,6 +563,79 @@ public class SipVideoCallClient implements SipListener {
         stopMedia();
     }
 
+    // ---------- 文字消息（SIP MESSAGE，RFC 3428）----------
+
+    /** 向被叫发送一条文字消息 */
+    public void sendMessage(String text) throws Exception {
+        String fromSipAddress = "sip:" + username + "@" + serverIp;
+        Address fromAddress = addressFactory.createAddress(fromSipAddress);
+        FromHeader fromHeader = headerFactory.createFromHeader(fromAddress, String.valueOf(System.currentTimeMillis()));
+
+        String toSipAddress = "sip:" + targetUser + "@" + serverIp;
+        Address toAddress = addressFactory.createAddress(toSipAddress);
+        ToHeader toHeader = headerFactory.createToHeader(toAddress, null);
+
+        ViaHeader viaHeader = headerFactory.createViaHeader(localIp, localPort, "udp", null);
+        List<ViaHeader> viaHeaders = new ArrayList<>();
+        viaHeaders.add(viaHeader);
+
+        CallIdHeader callIdHeader = sipProvider.getNewCallId();
+        CSeqHeader cSeqHeader = headerFactory.createCSeqHeader(messageCSeq++, Request.MESSAGE);
+        MaxForwardsHeader maxForwards = headerFactory.createMaxForwardsHeader(70);
+
+        SipURI requestURI = addressFactory.createSipURI(targetUser, serverIp);
+        requestURI.setPort(serverPort);
+
+        Request request = messageFactory.createRequest(requestURI, Request.MESSAGE,
+                callIdHeader, cSeqHeader, fromHeader, toHeader, viaHeaders, maxForwards);
+
+        SipURI contactURI = addressFactory.createSipURI(username, localIp);
+        contactURI.setPort(localPort);
+        Address contactAddress = addressFactory.createAddress(contactURI);
+        request.addHeader(headerFactory.createContactHeader(contactAddress));
+
+        // 声明可接收纯文本，便于对端回复
+        request.addHeader(headerFactory.createAcceptHeader("text", "plain"));
+
+        // SIP 消息体统一使用 UTF-8，避免中文乱码
+        ContentTypeHeader contentTypeHeader = headerFactory.createContentTypeHeader("text", "plain");
+        request.setContent(text.getBytes(StandardCharsets.UTF_8), contentTypeHeader);
+
+        ClientTransaction transaction = sipProvider.getNewClientTransaction(request);
+        transaction.sendRequest();
+    }
+
+    /** 启动控制台聊天：输入一行回车即发送，同时接收并显示对方消息 */
+    private void startChat() {
+        Thread t = new Thread(() -> {
+            System.out.println("\n===== 文字聊天已就绪 =====");
+            System.out.println("输入内容后回车 → 发送给 " + targetUser);
+            System.out.println("输入 /quit 回车 → 退出程序");
+            try (Scanner sc = new Scanner(System.in)) {
+                while (sc.hasNextLine()) {
+                    String line = sc.nextLine().trim();
+                    if (line.isEmpty()) continue;
+                    if (line.equals("/quit")) {
+                        System.out.println("收到退出指令");
+                        System.exit(0);
+                    }
+                    if (!isRegistered) {
+                        System.out.println("尚未注册成功，无法发送");
+                        continue;
+                    }
+                    try {
+                        sendMessage(line);
+                        System.out.println("[我 → " + targetUser + "] " + line);
+                    } catch (Exception e) {
+                        System.err.println("消息发送失败: " + e.getMessage());
+                    }
+                }
+            }
+        }, "ConsoleChat");
+        t.setDaemon(true);
+        t.start();
+    }
+
     @Override
     public void processRequest(RequestEvent requestEvent) {
         Request request = requestEvent.getRequest();
@@ -562,6 +652,17 @@ public class SipVideoCallClient implements SipListener {
                 serverTransaction.sendResponse(response);
                 System.out.println("通话已结束");
                 stopMedia();
+            } else if (request.getMethod().equals(Request.MESSAGE)) {
+                if (serverTransaction == null) {
+                    serverTransaction = sipProvider.getNewServerTransaction(request);
+                }
+                byte[] raw = request.getRawContent();
+                String text = (raw == null) ? "" : new String(raw, StandardCharsets.UTF_8);
+                FromHeader msgFrom = (FromHeader) request.getHeader(FromHeader.NAME);
+                String from = (msgFrom != null) ? msgFrom.getAddress().toString() : "未知";
+                System.out.println("\n[收到消息] 来自 " + from + "：" + text);
+                Response response = messageFactory.createResponse(200, request);
+                serverTransaction.sendResponse(response);
             }
         } catch (Exception e) {
             e.printStackTrace();

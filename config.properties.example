@@ -32,3 +32,5 @@ media.local.port=8000
 # ---------- 通话行为 ----------
 # 通话时长（秒），到时自动挂断
 call.duration.sec=180
+# 启动后是否自动呼叫被叫；只测文字消息时改成 false，避免启动就拨号
+call.auto.invite=true
