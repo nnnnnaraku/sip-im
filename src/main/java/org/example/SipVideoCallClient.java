@@ -9,8 +9,10 @@ import java.io.FileInputStream;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.security.MessageDigest;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.*;
 
 public class SipVideoCallClient implements SipListener {
@@ -47,6 +49,18 @@ public class SipVideoCallClient implements SipListener {
 
     /** 文字消息的 CSeq 序号，每发一条递增 */
     private long messageCSeq = 1;
+
+    /**
+     * 图片分片大小（Base64 字符数）。
+     * 实测：单个 SIP MESSAGE 的 Content-Length 超过 1000 左右就会被丢弃
+     * （总 UDP 载荷超过以太网 MTU 1472 字节后产生 IP 分片，分片包被链路丢弃）。
+     * 因此这里保守取 800，保证加上约 300 字节 SIP 头后仍不分片。
+     */
+    private final int IMG_CHUNK_SIZE = intCfg("im.image.chunk.size", 800);
+    /** 图片重组缓冲：图片id -> 分片数组（未到达的位置为 null） */
+    private final Map<String, List<String>> imgChunks = new ConcurrentHashMap<>();
+    /** 图片文件名（Base64 编码）：图片id -> nameB64 */
+    private final Map<String, String> imgNames = new ConcurrentHashMap<>();
 
     // 媒体组件
     private AudioCapture audioCapture;
@@ -173,6 +187,39 @@ public class SipVideoCallClient implements SipListener {
 
         // 注册
         register();
+
+        // 启动定时重新注册，避免 Expires 到期后失去联系
+        startReRegister();
+    }
+
+    /**
+     * 定时重新注册。
+     * REGISTER 中的 Expires=3600（1 小时），若不续订，1 小时后服务器会认为本机离线。
+     * 这里每隔 sip.register.interval.sec 秒重发一次 REGISTER（每次用新的 Call-ID，
+     * 因此 CSeq 可以从 1 重新开始，服务端会以同 Contact 覆盖旧绑定）。
+     */
+    private void startReRegister() {
+        int interval = intCfg("sip.register.interval.sec", 1800);
+        if (interval <= 0) {
+            System.out.println("定时重新注册: 已关闭 (sip.register.interval.sec <= 0)");
+            return;
+        }
+        Thread t = new Thread(() -> {
+            while (!Thread.currentThread().isInterrupted()) {
+                try {
+                    Thread.sleep(interval * 1000L);
+                    System.out.println("\n[定时重新注册] 距上次注册 " + interval + " 秒，重新发送 REGISTER...");
+                    register();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } catch (Exception e) {
+                    System.err.println("定时重新注册失败: " + e.getMessage());
+                }
+            }
+        }, "ReRegister");
+        t.setDaemon(true);
+        t.start();
+        System.out.println("定时重新注册: 每 " + interval + " 秒一次");
     }
 
     // 注册到SIP服务器
@@ -567,6 +614,11 @@ public class SipVideoCallClient implements SipListener {
 
     /** 向被叫发送一条文字消息 */
     public void sendMessage(String text) throws Exception {
+        sendRaw(text);
+    }
+
+    /** 向被叫发送一条 SIP MESSAGE，body 为消息体原文 */
+    private void sendRaw(String body) throws Exception {
         String fromSipAddress = "sip:" + username + "@" + serverIp;
         Address fromAddress = addressFactory.createAddress(fromSipAddress);
         FromHeader fromHeader = headerFactory.createFromHeader(fromAddress, String.valueOf(System.currentTimeMillis()));
@@ -599,18 +651,111 @@ public class SipVideoCallClient implements SipListener {
 
         // SIP 消息体统一使用 UTF-8，避免中文乱码
         ContentTypeHeader contentTypeHeader = headerFactory.createContentTypeHeader("text", "plain");
-        request.setContent(text.getBytes(StandardCharsets.UTF_8), contentTypeHeader);
+        request.setContent(body.getBytes(StandardCharsets.UTF_8), contentTypeHeader);
 
         ClientTransaction transaction = sipProvider.getNewClientTransaction(request);
         transaction.sendRequest();
     }
 
+    // ---------- 图片消息（Base64 分片，走 SIP MESSAGE）----------
+    //
+    // 帧格式：#IMG|<图片id>|<文件名Base64>|<片序号>|<总片数>|<Base64数据>
+    // 说明：这是本项目自定义的应用层分片协议，只有本项目客户端之间可以互通。
+
+    /** 发送图片：读取文件 -> Base64 -> 分片 -> 逐条 MESSAGE 发出 */
+    public void sendImage(File file) throws Exception {
+        if (!file.exists() || !file.isFile()) {
+            System.out.println("图片文件不存在: " + file.getAbsolutePath());
+            return;
+        }
+
+        byte[] data = Files.readAllBytes(file.toPath());
+        String b64 = Base64.getEncoder().encodeToString(data);
+        int total = (b64.length() + IMG_CHUNK_SIZE - 1) / IMG_CHUNK_SIZE;
+        String imgId = Long.toHexString(System.currentTimeMillis());
+        String nameB64 = Base64.getEncoder().encodeToString(
+                file.getName().getBytes(StandardCharsets.UTF_8));
+
+        System.out.println("开始发送图片: " + file.getName()
+                + "  |  原始 " + data.length + " 字节"
+                + " -> Base64 " + b64.length() + " 字符"
+                + " -> 分 " + total + " 片");
+
+        for (int i = 0; i < total; i++) {
+            int from = i * IMG_CHUNK_SIZE;
+            int to = Math.min(from + IMG_CHUNK_SIZE, b64.length());
+            String frame = "#IMG|" + imgId + "|" + nameB64 + "|" + i + "|" + total
+                    + "|" + b64.substring(from, to);
+            sendRaw(frame);
+            Thread.sleep(30); // 轻微限速，避免瞬间冲击服务器
+        }
+
+        System.out.println("图片发送完成: " + file.getName() + "（共 " + total + " 片）");
+    }
+
+    /** 处理收到的图片分片，凑齐后解码落盘 */
+    private void handleImageChunk(String body) {
+        String[] p = body.split("\\|", 6);
+        if (p.length < 6) return;
+
+        String id = p[1];
+        String nameB64 = p[2];
+        int index, total;
+        try {
+            index = Integer.parseInt(p[3]);
+            total = Integer.parseInt(p[4]);
+        } catch (NumberFormatException e) {
+            return;
+        }
+        String chunk = p[5];
+        if (total <= 0 || index < 0 || index >= total) return;
+
+        imgNames.putIfAbsent(id, nameB64);
+        List<String> slots = imgChunks.computeIfAbsent(id,
+                k -> new ArrayList<>(Collections.nCopies(total, (String) null)));
+
+        synchronized (slots) {
+            if (index < slots.size()) slots.set(index, chunk);
+        }
+
+        if (index == 0) {
+            System.out.println("\n[图片接收中] id=" + id + "  共 " + total + " 片 ...");
+        }
+
+        // 检查是否已凑齐
+        StringBuilder sb = new StringBuilder();
+        synchronized (slots) {
+            for (String s : slots) {
+                if (s == null) return; // 还没收齐
+                sb.append(s);
+            }
+        }
+
+        try {
+            byte[] data = Base64.getDecoder().decode(sb.toString());
+            String name = new String(Base64.getDecoder().decode(imgNames.get(id)),
+                    StandardCharsets.UTF_8);
+            File dir = new File("received");
+            if (!dir.exists()) dir.mkdirs();
+            File out = new File(dir, name);
+            Files.write(out.toPath(), data);
+            System.out.println("[收到图片] 已保存: " + out.getAbsolutePath()
+                    + "  (" + data.length + " 字节, " + total + " 片)");
+        } catch (Exception e) {
+            System.err.println("图片保存失败: " + e.getMessage());
+        } finally {
+            imgChunks.remove(id);
+            imgNames.remove(id);
+        }
+    }
+
     /** 启动控制台聊天：输入一行回车即发送，同时接收并显示对方消息 */
     private void startChat() {
         Thread t = new Thread(() -> {
-            System.out.println("\n===== 文字聊天已就绪 =====");
-            System.out.println("输入内容后回车 → 发送给 " + targetUser);
-            System.out.println("输入 /quit 回车 → 退出程序");
+            System.out.println("\n===== 文字 / 图片消息已就绪 =====");
+            System.out.println("输入内容后回车 → 发送文字给 " + targetUser);
+            System.out.println("输入 /img <图片路径> → 发送图片");
+            System.out.println("输入 /quit → 退出程序");
             try (Scanner sc = new Scanner(System.in)) {
                 while (sc.hasNextLine()) {
                     String line = sc.nextLine().trim();
@@ -618,6 +763,18 @@ public class SipVideoCallClient implements SipListener {
                     if (line.equals("/quit")) {
                         System.out.println("收到退出指令");
                         System.exit(0);
+                    }
+                    if (line.startsWith("/img ")) {
+                        if (!isRegistered) {
+                            System.out.println("尚未注册成功，无法发送");
+                            continue;
+                        }
+                        try {
+                            sendImage(new File(line.substring(5).trim()));
+                        } catch (Exception e) {
+                            System.err.println("图片发送失败: " + e.getMessage());
+                        }
+                        continue;
                     }
                     if (!isRegistered) {
                         System.out.println("尚未注册成功，无法发送");
@@ -658,9 +815,13 @@ public class SipVideoCallClient implements SipListener {
                 }
                 byte[] raw = request.getRawContent();
                 String text = (raw == null) ? "" : new String(raw, StandardCharsets.UTF_8);
-                FromHeader msgFrom = (FromHeader) request.getHeader(FromHeader.NAME);
-                String from = (msgFrom != null) ? msgFrom.getAddress().toString() : "未知";
-                System.out.println("\n[收到消息] 来自 " + from + "：" + text);
+                if (text.startsWith("#IMG|")) {
+                    handleImageChunk(text);
+                } else {
+                    FromHeader msgFrom = (FromHeader) request.getHeader(FromHeader.NAME);
+                    String from = (msgFrom != null) ? msgFrom.getAddress().toString() : "未知";
+                    System.out.println("\n[收到消息] 来自 " + from + "：" + text);
+                }
                 Response response = messageFactory.createResponse(200, request);
                 serverTransaction.sendResponse(response);
             }
