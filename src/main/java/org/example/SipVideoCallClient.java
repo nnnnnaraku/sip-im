@@ -70,6 +70,8 @@ public class SipVideoCallClient implements SipListener {
     private int localAudioPort = intCfg("media.local.port", 8000);
     private String remoteAudioIp;
     private int remoteAudioPort;
+    /** 音频电平监视线程的运行标志 */
+    private volatile boolean levelMonitorRunning = false;
 
     // ---------- 配置加载 ----------
 
@@ -199,7 +201,7 @@ public class SipVideoCallClient implements SipListener {
      * 因此 CSeq 可以从 1 重新开始，服务端会以同 Contact 覆盖旧绑定）。
      */
     private void startReRegister() {
-        int interval = intCfg("sip.register.interval.sec", 1800);
+        int interval = intCfg("sip.register.interval.sec", 300);
         if (interval <= 0) {
             System.out.println("定时重新注册: 已关闭 (sip.register.interval.sec <= 0)");
             return;
@@ -499,11 +501,38 @@ public class SipVideoCallClient implements SipListener {
             });
 
             System.out.println("✓ 音频流已启动，可以开始通话！");
+            startLevelMonitor();
 
         } catch (Exception e) {
             System.err.println("启动媒体流失败: " + e.getMessage());
             e.printStackTrace();
         }
+    }
+
+    /**
+     * 每 2 秒打印一次上下行音频电平，用于客观判断音频是否真的有内容（不靠人耳）。
+     * 电平 = 16bit PCM 的绝对平均值，范围 0~32767：
+     *   静音 ≈ 0~300    正常说话 ≈ 500~8000    越大越响
+     */
+    private void startLevelMonitor() {
+        levelMonitorRunning = true;
+        Thread t = new Thread(() -> {
+            System.out.println("\n[音频电平监视] 每 2 秒打印一次：你对手机说话看「上行」，手机说话看「下行」");
+            while (levelMonitorRunning) {
+                try {
+                    Thread.sleep(2000);
+                } catch (InterruptedException e) {
+                    break;
+                }
+                if (!levelMonitorRunning || rtpSender == null || rtpReceiver == null) continue;
+                System.out.println("[音频电平]  上行(你说话)=" + rtpSender.getMicLevel()
+                        + "   下行(对端说话)=" + rtpReceiver.getRecvLevel()
+                        + "   收发包数=" + rtpSender.getPacketsSent() + "/" + rtpReceiver.getPacketsReceived());
+            }
+            System.out.println("[音频电平监视] 已停止");
+        }, "LevelMonitor");
+        t.setDaemon(true);
+        t.start();
     }
 
     // 解析SDP获取远程媒体信息
@@ -531,6 +560,7 @@ public class SipVideoCallClient implements SipListener {
     // 停止媒体流
     private void stopMedia() {
         System.out.println("\n停止音频流...");
+        levelMonitorRunning = false;
 
         // 先打印收发统计：用于判断音频是否真的双向流动（不依赖人耳）
         long sent = (rtpSender != null) ? rtpSender.getPacketsSent() : 0;
@@ -903,6 +933,29 @@ public class SipVideoCallClient implements SipListener {
     @Override
     public void processTimeout(TimeoutEvent timeoutEvent) {
         System.out.println("请求超时");
+
+        // 注册超时通常意味着服务器刚重启或暂时不可达。
+        // 这里 30 秒后立即重试，服务器一恢复就能很快重新注册上，
+        // 而不用干等到下一个重注册周期。
+        try {
+            ClientTransaction tx = timeoutEvent.getClientTransaction();
+            if (tx != null && tx.getRequest() != null
+                    && Request.REGISTER.equals(tx.getRequest().getMethod())) {
+                System.out.println("[注册超时] 30 秒后自动重试注册...");
+                Thread retry = new Thread(() -> {
+                    try {
+                        Thread.sleep(30000);
+                        register();
+                    } catch (Exception e) {
+                        System.err.println("重试注册失败: " + e.getMessage());
+                    }
+                }, "RegisterRetry");
+                retry.setDaemon(true);
+                retry.start();
+            }
+        } catch (Exception e) {
+            // 拿不到事务信息时忽略，不影响主流程
+        }
     }
 
     @Override

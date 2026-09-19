@@ -10,6 +10,8 @@ public class RTPAudioReceiver {
     private AudioFormat format;
     /** 已收到的 RTP 包数（用于判断音频是否真的在接收） */
     private volatile long packetsReceived = 0;
+    /** 收到音频的平均电平（0~32767），用于判断收到的到底是有声音还是静音 */
+    private volatile int recvLevel = 0;
 
     public RTPAudioReceiver(int localPort) throws Exception {
         socket = new DatagramSocket(localPort);
@@ -35,6 +37,11 @@ public class RTPAudioReceiver {
     /** 已收到的 RTP 包数 */
     public long getPacketsReceived() {
         return packetsReceived;
+    }
+
+    /** 收到音频的当前平均电平（对端说话时明显上升，静音时接近 0） */
+    public int getRecvLevel() {
+        return recvLevel;
     }
 
     public void start() {
@@ -91,6 +98,16 @@ public class RTPAudioReceiver {
 
                     // 解码 PCMU 为 PCM
                     byte[] pcmData = PCMUEncoder.decode(mulawData);
+
+                    // 统计收到音频的电平（有声音时有明显数值，静音时接近 0）
+                    int sum = 0;
+                    int n = pcmData.length / 2;
+                    for (int i = 0; i < n; i++) {
+                        int s = (short) ((pcmData[2 * i + 1] << 8) | (pcmData[2 * i] & 0xFF));
+                        sum += Math.abs(s);
+                    }
+                    int avg = (n > 0) ? (sum / n) : 0;
+                    recvLevel = (int) (recvLevel * 0.85 + avg * 0.15);
 
                     // 播放音频
                     speaker.write(pcmData, 0, pcmData.length);

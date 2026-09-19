@@ -14,6 +14,8 @@ public class RTPAudioSender {
     private long startTime;
     /** 已成功发出的 RTP 包数（用于判断音频是否真的在发送） */
     private volatile long packetsSent = 0;
+    /** 麦克风采集音频的平均电平（0~32767），用于判断是否真的采到了声音 */
+    private volatile int micLevel = 0;
 
     /**
      * 复用外部已有 socket（一般是 RTPAudioReceiver 的），
@@ -43,6 +45,16 @@ public class RTPAudioSender {
 
     public void sendAudio(byte[] pcmData, int length) {
         if (remoteAddress == null) return;
+
+        // 统计麦克风电平（16bit little-endian 有符号 PCM 的绝对平均值）
+        int sum = 0;
+        int n = length / 2;
+        for (int i = 0; i < n; i++) {
+            int s = (short) ((pcmData[2 * i + 1] << 8) | (pcmData[2 * i] & 0xFF));
+            sum += Math.abs(s);
+        }
+        int avg = (n > 0) ? (sum / n) : 0;
+        micLevel = (int) (micLevel * 0.85 + avg * 0.15);
 
         try {
             // 将 16bit PCM 转换为 8bit PCMU
@@ -98,6 +110,11 @@ public class RTPAudioSender {
     /** 已成功发出的 RTP 包数 */
     public long getPacketsSent() {
         return packetsSent;
+    }
+
+    /** 麦克风当前平均电平（说话时明显上升，静音时接近 0） */
+    public int getMicLevel() {
+        return micLevel;
     }
 
     public void close() {
