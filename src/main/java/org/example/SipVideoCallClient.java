@@ -43,6 +43,13 @@ public class SipVideoCallClient implements SipListener {
     /** 启动后是否自动呼叫被叫（测文字消息时建议设为 false） */
     private static final boolean AUTO_INVITE = boolCfg("call.auto.invite", true);
 
+    /** 常驻模式：true = 程序持续运行直到 /quit 或 Ctrl+C；false = 跑完固定时长自动退出 */
+    private static final boolean KEEP_ALIVE = boolCfg("app.keep.alive", true);
+
+    /** 常驻模式下阻塞主线程，收到 /quit 时释放，让主线程走正常的关闭流程 */
+    private static final java.util.concurrent.CountDownLatch SHUTDOWN_LATCH =
+            new java.util.concurrent.CountDownLatch(1);
+
     private Dialog dialog;
     private ClientTransaction inviteTransaction;
     private boolean isRegistered = false;
@@ -135,8 +142,15 @@ public class SipVideoCallClient implements SipListener {
                 System.out.println("注册失败，无法发起呼叫");
             }
 
-            // 保持程序运行：等通话（含自动挂断）结束后再退出
-            Thread.sleep((CALL_DURATION_SEC + 60) * 1000L);
+            if (KEEP_ALIVE) {
+                // 常驻模式：一直运行，直到用户在控制台输入 /quit（或按 Ctrl+C）
+                System.out.println("\n[常驻模式] 程序将持续运行；输入 /quit 或按 Ctrl+C 退出");
+                SHUTDOWN_LATCH.await();
+                System.out.println("\n收到退出信号，正在关闭...");
+            } else {
+                // 非常驻：等通话（含自动挂断）结束后再退出
+                Thread.sleep((CALL_DURATION_SEC + 60) * 1000L);
+            }
 
             client.shutdown();
 
@@ -791,8 +805,9 @@ public class SipVideoCallClient implements SipListener {
                     String line = sc.nextLine().trim();
                     if (line.isEmpty()) continue;
                     if (line.equals("/quit")) {
-                        System.out.println("收到退出指令");
-                        System.exit(0);
+                        System.out.println("收到退出指令，正在关闭...");
+                        SHUTDOWN_LATCH.countDown();
+                        break;
                     }
                     if (line.startsWith("/img ")) {
                         if (!isRegistered) {

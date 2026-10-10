@@ -47,3 +47,8 @@ im.image.chunk.size=800
 call.duration.sec=180
 # 启动后是否自动呼叫被叫；只测文字消息时改成 false，避免启动就拨号
 call.auto.invite=true
+
+# ---------- 运行模式 ----------
+# 常驻模式：true  = 程序持续运行，输入 /quit 或按 Ctrl+C 才退出（推荐，便于演示/调试）；
+#          false = 启动后跑固定时长（通话时长 + 60 秒）自动退出。
+app.keep.alive=true
