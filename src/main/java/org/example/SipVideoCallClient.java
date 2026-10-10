@@ -58,16 +58,23 @@ public class SipVideoCallClient implements SipListener {
     private long messageCSeq = 1;
 
     /**
-     * 图片分片大小（Base64 字符数）。
+     * 文件分片大小（Base64 字符数），图片与语音消息共用。
      * 实测：单个 SIP MESSAGE 的 Content-Length 超过 1000 左右就会被丢弃
      * （总 UDP 载荷超过以太网 MTU 1472 字节后产生 IP 分片，分片包被链路丢弃）。
      * 因此这里保守取 800，保证加上约 300 字节 SIP 头后仍不分片。
      */
-    private final int IMG_CHUNK_SIZE = intCfg("im.image.chunk.size", 800);
-    /** 图片重组缓冲：图片id -> 分片数组（未到达的位置为 null） */
-    private final Map<String, List<String>> imgChunks = new ConcurrentHashMap<>();
-    /** 图片文件名（Base64 编码）：图片id -> nameB64 */
-    private final Map<String, String> imgNames = new ConcurrentHashMap<>();
+    private final int FILE_CHUNK_SIZE = intCfg("im.file.chunk.size", 800);
+    /** 文件重组缓冲：文件id -> 分片数组（未到达的位置为 null） */
+    private final Map<String, List<String>> fileChunks = new ConcurrentHashMap<>();
+    /** 文件名（Base64 编码）：文件id -> nameB64 */
+    private final Map<String, String> fileNames = new ConcurrentHashMap<>();
+    /** 文件类型：文件id -> IMG / VOICE */
+    private final Map<String, String> fileTypes = new ConcurrentHashMap<>();
+
+    /** 语音消息默认时长（秒） */
+    private static final int VOICE_DURATION_SEC = intCfg("im.voice.duration.sec", 5);
+    /** 最近收到的语音消息文件，供 /play 重放 */
+    private volatile File lastVoiceFile;
 
     // 媒体组件
     private AudioCapture audioCapture;
@@ -701,61 +708,72 @@ public class SipVideoCallClient implements SipListener {
         transaction.sendRequest();
     }
 
-    // ---------- 图片消息（Base64 分片，走 SIP MESSAGE）----------
+    // ---------- 文件消息（Base64 分片，走 SIP MESSAGE）----------
     //
-    // 帧格式：#IMG|<图片id>|<文件名Base64>|<片序号>|<总片数>|<Base64数据>
-    // 说明：这是本项目自定义的应用层分片协议，只有本项目客户端之间可以互通。
+    // 帧格式：#FILE|<类型>|<文件id>|<文件名Base64>|<片序号>|<总片数>|<Base64数据>
+    //   类型：IMG = 图片，VOICE = 语音消息（以后可扩展 VIDEO）
+    // 说明：这是本项目自定义的应用层分片协议，只有本项目客户端之间可以互通
+    //       （手机端 Linphone 不认识这个格式）。
 
-    /** 发送图片：读取文件 -> Base64 -> 分片 -> 逐条 MESSAGE 发出 */
-    public void sendImage(File file) throws Exception {
+    /** 文件类型的中文名，用于日志 */
+    private String typeName(String type) {
+        if ("VOICE".equals(type)) return "语音消息";
+        if ("IMG".equals(type)) return "图片";
+        return "文件";
+    }
+
+    /** 发送文件：读取 -> Base64 -> 分片 -> 逐条 MESSAGE 发出 */
+    public void sendFile(File file, String type) throws Exception {
         if (!file.exists() || !file.isFile()) {
-            System.out.println("图片文件不存在: " + file.getAbsolutePath());
+            System.out.println("文件不存在: " + file.getAbsolutePath());
             return;
         }
 
         byte[] data = Files.readAllBytes(file.toPath());
         String b64 = Base64.getEncoder().encodeToString(data);
-        int total = (b64.length() + IMG_CHUNK_SIZE - 1) / IMG_CHUNK_SIZE;
-        String imgId = Long.toHexString(System.currentTimeMillis());
+        int total = (b64.length() + FILE_CHUNK_SIZE - 1) / FILE_CHUNK_SIZE;
+        String fileId = Long.toHexString(System.currentTimeMillis());
         String nameB64 = Base64.getEncoder().encodeToString(
                 file.getName().getBytes(StandardCharsets.UTF_8));
 
-        System.out.println("开始发送图片: " + file.getName()
+        System.out.println("开始发送" + typeName(type) + ": " + file.getName()
                 + "  |  原始 " + data.length + " 字节"
                 + " -> Base64 " + b64.length() + " 字符"
                 + " -> 分 " + total + " 片");
 
         for (int i = 0; i < total; i++) {
-            int from = i * IMG_CHUNK_SIZE;
-            int to = Math.min(from + IMG_CHUNK_SIZE, b64.length());
-            String frame = "#IMG|" + imgId + "|" + nameB64 + "|" + i + "|" + total
+            int from = i * FILE_CHUNK_SIZE;
+            int to = Math.min(from + FILE_CHUNK_SIZE, b64.length());
+            String frame = "#FILE|" + type + "|" + fileId + "|" + nameB64 + "|" + i + "|" + total
                     + "|" + b64.substring(from, to);
             sendRaw(frame);
             Thread.sleep(30); // 轻微限速，避免瞬间冲击服务器
         }
 
-        System.out.println("图片发送完成: " + file.getName() + "（共 " + total + " 片）");
+        System.out.println(typeName(type) + "发送完成: " + file.getName() + "（共 " + total + " 片）");
     }
 
-    /** 处理收到的图片分片，凑齐后解码落盘 */
-    private void handleImageChunk(String body) {
-        String[] p = body.split("\\|", 6);
-        if (p.length < 6) return;
+    /** 处理收到的文件分片，凑齐后解码落盘；语音消息额外自动播放 */
+    private void handleFileChunk(String body) {
+        String[] p = body.split("\\|", 7);
+        if (p.length < 7) return;
 
-        String id = p[1];
-        String nameB64 = p[2];
+        String type = p[1];
+        String id = p[2];
+        String nameB64 = p[3];
         int index, total;
         try {
-            index = Integer.parseInt(p[3]);
-            total = Integer.parseInt(p[4]);
+            index = Integer.parseInt(p[4]);
+            total = Integer.parseInt(p[5]);
         } catch (NumberFormatException e) {
             return;
         }
-        String chunk = p[5];
+        String chunk = p[6];
         if (total <= 0 || index < 0 || index >= total) return;
 
-        imgNames.putIfAbsent(id, nameB64);
-        List<String> slots = imgChunks.computeIfAbsent(id,
+        fileNames.putIfAbsent(id, nameB64);
+        fileTypes.putIfAbsent(id, type);
+        List<String> slots = fileChunks.computeIfAbsent(id,
                 k -> new ArrayList<>(Collections.nCopies(total, (String) null)));
 
         synchronized (slots) {
@@ -763,7 +781,7 @@ public class SipVideoCallClient implements SipListener {
         }
 
         if (index == 0) {
-            System.out.println("\n[图片接收中] id=" + id + "  共 " + total + " 片 ...");
+            System.out.println("\n[" + typeName(type) + "接收中] id=" + id + "  共 " + total + " 片 ...");
         }
 
         // 检查是否已凑齐
@@ -777,29 +795,47 @@ public class SipVideoCallClient implements SipListener {
 
         try {
             byte[] data = Base64.getDecoder().decode(sb.toString());
-            String name = new String(Base64.getDecoder().decode(imgNames.get(id)),
+            String name = new String(Base64.getDecoder().decode(fileNames.get(id)),
                     StandardCharsets.UTF_8);
             File dir = new File("received");
             if (!dir.exists()) dir.mkdirs();
             File out = new File(dir, name);
             Files.write(out.toPath(), data);
-            System.out.println("[收到图片] 已保存: " + out.getAbsolutePath()
+            System.out.println("[收到" + typeName(type) + "] 已保存: " + out.getAbsolutePath()
                     + "  (" + data.length + " 字节, " + total + " 片)");
+
+            if ("VOICE".equals(type)) {
+                lastVoiceFile = out;
+                System.out.println("[语音消息] 自动播放中...（可用 /play 重放）");
+                // 播放会阻塞，必须放到独立线程，不能卡住 SIP 事件线程
+                Thread player = new Thread(() -> VoiceIO.play(out), "VoicePlay");
+                player.setDaemon(true);
+                player.start();
+            }
         } catch (Exception e) {
-            System.err.println("图片保存失败: " + e.getMessage());
+            System.err.println("文件保存失败: " + e.getMessage());
         } finally {
-            imgChunks.remove(id);
-            imgNames.remove(id);
+            fileChunks.remove(id);
+            fileNames.remove(id);
+            fileTypes.remove(id);
         }
+    }
+
+    /** 当前是否有媒体流在跑（即通话进行中） */
+    private boolean isMediaActive() {
+        return rtpSender != null || rtpReceiver != null;
     }
 
     /** 启动控制台聊天：输入一行回车即发送，同时接收并显示对方消息 */
     private void startChat() {
         Thread t = new Thread(() -> {
-            System.out.println("\n===== 文字 / 图片消息已就绪 =====");
-            System.out.println("输入内容后回车 → 发送文字给 " + targetUser);
-            System.out.println("输入 /img <图片路径> → 发送图片");
-            System.out.println("输入 /quit → 退出程序");
+            System.out.println("\n===== 消息功能已就绪（文字 / 图片 / 语音）=====");
+            System.out.println("输入内容后回车         → 发送文字给 " + targetUser);
+            System.out.println("输入 /img <图片路径>    → 发送图片");
+            System.out.println("输入 /rec [秒数]        → 录一段语音消息并发送（默认 "
+                    + VOICE_DURATION_SEC + " 秒）");
+            System.out.println("输入 /play              → 重放最近收到的语音消息");
+            System.out.println("输入 /quit              → 退出程序");
             try (Scanner sc = new Scanner(System.in)) {
                 while (sc.hasNextLine()) {
                     String line = sc.nextLine().trim();
@@ -815,9 +851,52 @@ public class SipVideoCallClient implements SipListener {
                             continue;
                         }
                         try {
-                            sendImage(new File(line.substring(5).trim()));
+                            sendFile(new File(line.substring(5).trim()), "IMG");
                         } catch (Exception e) {
                             System.err.println("图片发送失败: " + e.getMessage());
+                        }
+                        continue;
+                    }
+                    if (line.startsWith("/rec")) {
+                        if (isMediaActive()) {
+                            System.out.println("通话进行中，麦克风正被占用，无法录制语音消息");
+                            continue;
+                        }
+                        if (!isRegistered) {
+                            System.out.println("尚未注册成功，无法发送");
+                            continue;
+                        }
+                        int sec = VOICE_DURATION_SEC;
+                        String arg = line.substring(4).trim();
+                        if (!arg.isEmpty()) {
+                            try {
+                                sec = Integer.parseInt(arg);
+                            } catch (NumberFormatException e) {
+                                System.out.println("用法：/rec [秒数]，例如 /rec 8");
+                                continue;
+                            }
+                        }
+                        if (sec <= 0 || sec > 60) {
+                            System.out.println("录制时长需在 1~60 秒之间");
+                            continue;
+                        }
+                        try {
+                            File wav = File.createTempFile("voice-", ".wav");
+                            File rec = VoiceIO.record(sec, wav);
+                            if (rec != null) {
+                                sendFile(rec, "VOICE");
+                                rec.delete();
+                            }
+                        } catch (Exception e) {
+                            System.err.println("语音消息发送失败: " + e.getMessage());
+                        }
+                        continue;
+                    }
+                    if (line.equals("/play")) {
+                        if (lastVoiceFile == null) {
+                            System.out.println("还没有收到过语音消息");
+                        } else {
+                            VoiceIO.play(lastVoiceFile);
                         }
                         continue;
                     }
@@ -860,8 +939,8 @@ public class SipVideoCallClient implements SipListener {
                 }
                 byte[] raw = request.getRawContent();
                 String text = (raw == null) ? "" : new String(raw, StandardCharsets.UTF_8);
-                if (text.startsWith("#IMG|")) {
-                    handleImageChunk(text);
+                if (text.startsWith("#FILE|")) {
+                    handleFileChunk(text);
                 } else {
                     FromHeader msgFrom = (FromHeader) request.getHeader(FromHeader.NAME);
                     String from = (msgFrom != null) ? msgFrom.getAddress().toString() : "未知";
