@@ -45,6 +45,18 @@ im.file.chunk.size=800
 # 语音消息默认录制时长（秒）。可用 /rec <秒数> 临时指定。
 im.voice.duration.sec=5
 
+# ---------- 视频通话 ----------
+# 是否启用视频（启用后 SDP 会带 m=video，通话时自动开摄像头）
+video.enabled=true
+# 采集分辨率与帧率（摄像头不支持时会自动退到最接近的可用分辨率）
+video.width=320
+video.height=240
+video.fps=10
+# JPEG 压缩质量（百分数，越小越省带宽但越糊）
+video.quality.percent=50
+# 本机视频 RTP 端口。同一台机器上跑多个客户端时要改成不同值（如 8022）
+video.local.port=8020
+
 # ---------- 通话行为 ----------
 # 通话时长（秒），到时自动挂断
 call.duration.sec=180

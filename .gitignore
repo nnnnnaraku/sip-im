@@ -12,6 +12,7 @@ sipServer.txt
 
 # ---- 本地配置（各机器不同，不入库；模板见 config.properties.example） ----
 config.properties
+config-*.properties
 
 # ---- 收到的图片/文件 ----
 received/

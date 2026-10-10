@@ -8,6 +8,8 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.security.MessageDigest;
@@ -76,6 +78,26 @@ public class SipVideoCallClient implements SipListener {
     /** 最近收到的语音消息文件，供 /play 重放 */
     private volatile File lastVoiceFile;
 
+    // ---------- 视频 ----------
+    /** 是否启用视频（SDP 中带 m=video） */
+    private static final boolean VIDEO_ENABLED = boolCfg("video.enabled", true);
+    private static final int VIDEO_WIDTH   = intCfg("video.width", 320);
+    private static final int VIDEO_HEIGHT  = intCfg("video.height", 240);
+    private static final int VIDEO_FPS     = intCfg("video.fps", 10);
+    /** JPEG 质量：配置里用百分数，便于写整数 */
+    private static final float VIDEO_QUALITY = intCfg("video.quality.percent", 50) / 100f;
+    /** 本机视频 RTP 端口（会写进 SDP 告知对端） */
+    private final int videoLocalPort = intCfg("video.local.port", 8020);
+
+    private VideoCapture videoCapture;
+    private RtpVideoSender videoSender;
+    private RtpVideoReceiver videoReceiver;
+    private DatagramSocket videoSocket;
+    private VideoWindow videoWindow;
+    private String remoteVideoIp;
+    private int remoteVideoPort = 0;
+    private volatile boolean videoRunning = false;
+
     // 媒体组件
     private AudioCapture audioCapture;
     private RTPAudioSender rtpSender;
@@ -92,9 +114,12 @@ public class SipVideoCallClient implements SipListener {
     /** 读取项目根目录下的 config.properties（不存在则全部用默认值） */
     private static Properties loadConfig() {
         Properties p = new Properties();
-        File f = new File("config.properties");
+        // 可用 -Dsip.config=xxx.properties 指定配置文件，
+        // 便于在同一台机器上跑多个客户端（各自不同的账号/端口）做联调。
+        String path = System.getProperty("sip.config", "config.properties");
+        File f = new File(path);
         if (!f.exists()) {
-            System.out.println("未找到 config.properties，使用内置默认配置");
+            System.out.println("未找到 " + path + "，使用内置默认配置");
             return p;
         }
         try (InputStream in = new FileInputStream(f);
@@ -102,7 +127,7 @@ public class SipVideoCallClient implements SipListener {
             p.load(r);
             System.out.println("已加载配置文件: " + f.getAbsolutePath());
         } catch (Exception e) {
-            System.err.println("读取 config.properties 失败，改用默认配置: " + e.getMessage());
+            System.err.println("读取 " + path + " 失败，改用默认配置: " + e.getMessage());
         }
         return p;
     }
@@ -375,16 +400,9 @@ public class SipVideoCallClient implements SipListener {
 
         ContentTypeHeader contentTypeHeader = headerFactory.createContentTypeHeader("application", "sdp");
 
-        String sdpData = "v=0\r\n" +
-                "o=" + username + " 123456 654321 IN IP4 " + localIp + "\r\n" +
-                "s=Audio Call\r\n" +
-                "c=IN IP4 " + localIp + "\r\n" +
-                "t=0 0\r\n" +
-                "m=audio " + localAudioPort + " RTP/AVP 0 8 101\r\n" +
-                "a=rtpmap:0 PCMU/8000\r\n" +
-                "a=rtpmap:8 PCMA/8000\r\n" +
-                "a=rtpmap:101 telephone-event/8000\r\n";
+        String sdpData = buildLocalSdp();
 
+        System.out.println("\n发出的SDP:\n" + sdpData);
         byte[] contents = sdpData.getBytes();
         request.setContent(contents, contentTypeHeader);
 
@@ -476,16 +494,9 @@ public class SipVideoCallClient implements SipListener {
         }
 
         ContentTypeHeader contentTypeHeader = headerFactory.createContentTypeHeader("application", "sdp");
-        String sdpData = "v=0\r\n" +
-                "o=" + username + " 123456 654321 IN IP4 " + localIp + "\r\n" +
-                "s=Audio Call\r\n" +
-                "c=IN IP4 " + localIp + "\r\n" +
-                "t=0 0\r\n" +
-                "m=audio " + localAudioPort + " RTP/AVP 0 8 101\r\n" +
-                "a=rtpmap:0 PCMU/8000\r\n" +
-                "a=rtpmap:8 PCMA/8000\r\n" +
-                "a=rtpmap:101 telephone-event/8000\r\n";
+        String sdpData = buildLocalSdp();
 
+        System.out.println("\n发出的SDP:\n" + sdpData);
         byte[] contents = sdpData.getBytes();
         request.setContent(contents, contentTypeHeader);
 
@@ -500,7 +511,6 @@ public class SipVideoCallClient implements SipListener {
         try {
             // 解析对方的SDP，获取IP和端口
             parseRemoteSDP(remoteSdp);
-
             System.out.println("\n=== 启动音频流 ===");
             System.out.println("本地音频端口: " + localAudioPort);
             System.out.println("远程音频地址: " + remoteAudioIp + ":" + remoteAudioPort);
@@ -523,11 +533,135 @@ public class SipVideoCallClient implements SipListener {
 
             System.out.println("✓ 音频流已启动，可以开始通话！");
             startLevelMonitor();
+            startVideo();
 
         } catch (Exception e) {
             System.err.println("启动媒体流失败: " + e.getMessage());
             e.printStackTrace();
         }
+    }
+
+    /** 构造本机 SDP（音频 + 可选视频），主叫和被叫共用 */
+    private String buildLocalSdp() {
+        return "v=0\r\n" +
+                "o=" + username + " 123456 654321 IN IP4 " + localIp + "\r\n" +
+                "s=Audio/Video Call\r\n" +
+                "c=IN IP4 " + localIp + "\r\n" +
+                "t=0 0\r\n" +
+                "m=audio " + localAudioPort + " RTP/AVP 0 8 101\r\n" +
+                "a=rtpmap:0 PCMU/8000\r\n" +
+                "a=rtpmap:8 PCMA/8000\r\n" +
+                "a=rtpmap:101 telephone-event/8000\r\n" +
+                videoSdpLine();
+    }
+
+    /** 生成 SDP 的视频行（未启用视频时返回空串） */
+    private String videoSdpLine() {
+        if (!VIDEO_ENABLED) return "";
+        return "m=video " + videoLocalPort + " RTP/AVP 26\r\n"
+                + "a=rtpmap:26 JPEG/90000\r\n";
+    }
+
+    /** 启动视频通道：采集 -> JPEG -> RTP 发送；同时接收对端画面并显示 */
+    private void startVideo() {
+        if (!VIDEO_ENABLED) return;
+        if (remoteVideoPort <= 0) {
+            System.out.println("对端 SDP 未提供 m=video，本次通话不带视频");
+            return;
+        }
+        try {
+            System.out.println("\n=== 启动视频流 ===");
+            System.out.println("本地视频端口: " + videoLocalPort);
+            System.out.println("远程视频地址: " + remoteVideoIp + ":" + remoteVideoPort);
+
+            videoSocket = new DatagramSocket(videoLocalPort);
+
+            videoReceiver = new RtpVideoReceiver(videoSocket, jpeg -> {
+                java.awt.image.BufferedImage img = VideoCodec.decode(jpeg);
+                if (img != null && videoWindow != null) videoWindow.updateRemote(img);
+            });
+            videoReceiver.start();
+
+            videoSender = new RtpVideoSender(videoSocket);
+            videoSender.setRemote(InetAddress.getByName(remoteVideoIp), remoteVideoPort);
+            videoSender.setFps(VIDEO_FPS);
+
+            try {
+                videoCapture = new VideoCapture(VIDEO_WIDTH, VIDEO_HEIGHT);
+                videoCapture.start();
+            } catch (Exception camEx) {
+                // 摄像头打不开（例如被别的程序占用）时，保留"只看不发"的能力，
+                // 而不是把整条视频通道拆掉——对端画面仍然能收能看。
+                System.err.println("摄像头不可用（" + camEx.getMessage() + "），本次仅接收视频");
+                videoCapture = null;
+            }
+
+            videoWindow = new VideoWindow(VIDEO_WIDTH, VIDEO_HEIGHT);
+            videoWindow.showWindow();
+
+            videoRunning = true;
+            startVideoLoop();
+            System.out.println("✓ 视频流已启动（"
+                    + VIDEO_WIDTH + "x" + VIDEO_HEIGHT + " @" + VIDEO_FPS + "fps）");
+        } catch (Exception e) {
+            System.err.println("启动视频失败: " + e.getMessage());
+            stopVideo();
+        }
+    }
+
+    /** 采集循环：按帧率抓帧 -> 编码 -> 发送，同时刷新本地预览 */
+    private void startVideoLoop() {
+        Thread t = new Thread(() -> {
+            long interval = 1000L / Math.max(1, VIDEO_FPS);
+            while (videoRunning) {
+                long t0 = System.currentTimeMillis();
+                try {
+                    if (videoCapture != null) {
+                        java.awt.image.BufferedImage img = videoCapture.grab();
+                        if (img != null) {
+                            videoWindow.updateLocal(img);
+                            byte[] jpeg = VideoCodec.encode(img, VIDEO_QUALITY);
+                            videoSender.sendFrame(jpeg);
+                        }
+                    } else {
+                        Thread.sleep(interval); // 无摄像头：只收不发
+                    }
+                } catch (Exception e) {
+                    System.err.println("视频采集/编码失败: " + e.getMessage());
+                }
+                long sleep = interval - (System.currentTimeMillis() - t0);
+                if (sleep > 0) {
+                    try { Thread.sleep(sleep); } catch (InterruptedException e) { break; }
+                }
+            }
+        }, "VideoLoop");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /** 停止视频并打印统计 */
+    private void stopVideo() {
+        if (!videoRunning && videoCapture == null && videoSocket == null) return;
+        videoRunning = false;
+        System.out.println("\n停止视频流...");
+
+        long vs = (videoSender != null) ? videoSender.getFramesSent() : 0;
+        long vr = (videoReceiver != null) ? videoReceiver.getFramesReceived() : 0;
+        long vd = (videoReceiver != null) ? videoReceiver.getDroppedFrames() : 0;
+        long fs = (videoSender != null) ? videoSender.getLastFrameSize() : 0;
+        System.out.println("=== 视频收发统计 ===");
+        System.out.println("  已发送帧: " + vs + "  (末帧 " + fs + " 字节)");
+        System.out.println("  已接收帧: " + vr + "   丢弃: " + vd);
+        if (vr == 0) System.out.println("  !! 未收到视频帧 —— 对端到你方向不通");
+        else if (vs == 0) System.out.println("  !! 未发送视频帧 —— 摄像头可能没出图");
+        else System.out.println("  OK 双向都有视频帧");
+
+        if (videoCapture != null) { videoCapture.stop(); videoCapture = null; }
+        if (videoReceiver != null) { videoReceiver.stop(); videoReceiver = null; }
+        if (videoSocket != null) { videoSocket.close(); videoSocket = null; }
+        videoSender = null;
+        if (videoWindow != null) { videoWindow.closeWindow(); videoWindow = null; }
+        System.out.println("视频流已停止");
     }
 
     /**
@@ -575,13 +709,25 @@ public class SipVideoCallClient implements SipListener {
             remoteAudioPort = Integer.parseInt(mMatcher.group(1));
         }
 
-        System.out.println("解析结果 - IP: " + remoteAudioIp + ", Port: " + remoteAudioPort);
+        // 解析 m=video 行获取端口（对端可能不支持视频）
+        remoteVideoPort = 0;
+        Pattern vPattern = Pattern.compile("m=video (\\d+)");
+        Matcher vMatcher = vPattern.matcher(sdp);
+        if (vMatcher.find()) {
+            remoteVideoPort = Integer.parseInt(vMatcher.group(1));
+            remoteVideoIp = remoteAudioIp;   // 同一 SDP 里的 c= 行对音视频通用
+        }
+
+        System.out.println("解析结果 - IP: " + remoteAudioIp
+                + ", 音频端口: " + remoteAudioPort
+                + ", 视频端口: " + (remoteVideoPort > 0 ? remoteVideoPort : "无"));
     }
 
     // 停止媒体流
     private void stopMedia() {
         System.out.println("\n停止音频流...");
         levelMonitorRunning = false;
+        stopVideo();
 
         // 先打印收发统计：用于判断音频是否真的双向流动（不依赖人耳）
         long sent = (rtpSender != null) ? rtpSender.getPacketsSent() : 0;
@@ -948,10 +1094,72 @@ public class SipVideoCallClient implements SipListener {
                 }
                 Response response = messageFactory.createResponse(200, request);
                 serverTransaction.sendResponse(response);
+            } else if (request.getMethod().equals(Request.INVITE)) {
+                handleIncomingInvite(request, serverTransaction);
             }
         } catch (Exception e) {
             e.printStackTrace();
         }
+    }
+
+    /**
+     * 处理来电：自动接听。
+     *
+     * <p>流程：100 Trying -> 180 Ringing -> 200 OK（携带本机 SDP），
+     * 然后把对端 SDP 交给 startMedia 建立音频与视频通道。
+     *
+     * <p>本项目定位是课程演示客户端，所以采用"自动接听"而不是弹窗确认。
+     */
+    private void handleIncomingInvite(Request request, ServerTransaction tx) throws Exception {
+        if (tx == null) {
+            tx = sipProvider.getNewServerTransaction(request);
+        }
+
+        tx.sendResponse(messageFactory.createResponse(Response.TRYING, request));
+
+        FromHeader from = (FromHeader) request.getHeader(FromHeader.NAME);
+        System.out.println("\n[来电] 来自 " + ((from != null) ? from.getAddress() : "未知")
+                + "，自动接听...");
+
+        // Contact 头：告知对端本机的可达地址
+        SipURI contactURI = addressFactory.createSipURI(username, localIp);
+        contactURI.setPort(localPort);
+        Address contactAddress = addressFactory.createAddress(contactURI);
+
+        Response ringing = messageFactory.createResponse(Response.RINGING, request);
+        ringing.addHeader(headerFactory.createContactHeader(contactAddress));
+        tx.sendResponse(ringing);
+
+        // 200 OK + 本机 SDP
+        Response ok = messageFactory.createResponse(Response.OK, request);
+        ok.addHeader(headerFactory.createContactHeader(contactAddress));
+        ContentTypeHeader ct = headerFactory.createContentTypeHeader("application", "sdp");
+        String localSdp = buildLocalSdp();
+        System.out.println("\n发出的SDP:\n" + localSdp);
+        ok.setContent(localSdp.getBytes(StandardCharsets.UTF_8), ct);
+        tx.sendResponse(ok);
+
+        if (dialog == null) {
+            dialog = tx.getDialog();
+        }
+        System.out.println("✓ 已接听，通话建立成功!");
+
+        // 对端 SDP -> 建立媒体（音频 + 视频）
+        byte[] raw = request.getRawContent();
+        if (raw != null && raw.length > 0) {
+            startMedia(new String(raw, StandardCharsets.UTF_8));
+        }
+
+        // 达到设定通话时长后自动挂断
+        new Thread(() -> {
+            try {
+                Thread.sleep(CALL_DURATION_SEC * 1000L);
+                System.out.println("\n通话达到 " + CALL_DURATION_SEC + " 秒，自动挂断...");
+                hangup();
+            } catch (Exception e) {
+                // 对方提前挂断时会走到这里，属正常
+            }
+        }, "AutoHangupCallee").start();
     }
 
     @Override
