@@ -162,6 +162,8 @@ public class SipVideoCallClient implements SipListener {
     private String remoteVideoIp;
     private int remoteVideoPort = 0;
     private volatile boolean videoRunning = false;
+    /** 本次通话是否带视频（false = 纯语音通话） */
+    private volatile boolean videoCall = false;
 
     // 媒体组件
     private AudioCapture audioCapture;
@@ -434,7 +436,18 @@ public class SipVideoCallClient implements SipListener {
     }
 
     // 发起呼叫
+    /** 发起通话（默认带视频，供命令行客户端使用） */
     public void makeCall() throws Exception {
+        makeCall(true);
+    }
+
+    /**
+     * 发起通话。
+     *
+     * @param video true = 视频通话（SDP 带 m=video）；false = 纯语音通话
+     */
+    public void makeCall(boolean video) throws Exception {
+        this.videoCall = video && VIDEO_ENABLED;
         String fromSipAddress = "sip:" + username + "@" + serverIp;
         Address fromAddress = addressFactory.createAddress(fromSipAddress);
         FromHeader fromHeader = headerFactory.createFromHeader(fromAddress, String.valueOf(System.currentTimeMillis()));
@@ -627,7 +640,7 @@ public class SipVideoCallClient implements SipListener {
                 "a=rtpmap:0 PCMU/8000\r\n" +
                 "a=rtpmap:8 PCMA/8000\r\n" +
                 "a=rtpmap:101 telephone-event/8000\r\n" +
-                videoSdpLine();
+                (videoCall ? videoSdpLine() : "");
     }
 
     /** 生成 SDP 的视频行（未启用视频时返回空串） */
@@ -640,6 +653,10 @@ public class SipVideoCallClient implements SipListener {
     /** 启动视频通道：采集 -> JPEG -> RTP 发送；同时接收对端画面并显示 */
     private void startVideo() {
         if (!VIDEO_ENABLED) return;
+        if (!videoCall) {
+            System.out.println("本次为语音通话，不启用视频");
+            return;
+        }
         if (remoteVideoPort <= 0) {
             System.out.println("对端 SDP 未提供 m=video，本次通话不带视频");
             return;
@@ -814,6 +831,10 @@ public class SipVideoCallClient implements SipListener {
             notifyCall("ended", callPeer);
             callStartMillis = 0;
         }
+        // 关键：清空 dialog，否则下一次通话会沿用上一次的 dialog，
+        // 导致 BYE/ACK 发给上一次的对端（表现为对方收到挂断后画面卡住）
+        dialog = null;
+        inviteTransaction = null;
         System.out.println("\n停止音频流...");
         levelMonitorRunning = false;
         stopVideo();
@@ -834,12 +855,15 @@ public class SipVideoCallClient implements SipListener {
 
         if (audioCapture != null) {
             audioCapture.stop();
+            audioCapture = null;
         }
         if (rtpSender != null) {
             rtpSender.close();
+            rtpSender = null;
         }
         if (rtpReceiver != null) {
             rtpReceiver.stop();
+            rtpReceiver = null;
         }
 
         System.out.println("音频流已停止");
@@ -917,17 +941,62 @@ public class SipVideoCallClient implements SipListener {
         }
     }
 
-    /** 用本机麦克风录一段语音并作为语音消息发出（Web 端"语音"按钮用） */
+    /** 用本机麦克风录一段固定时长的语音并发出（Web 端的快捷方式） */
     public void recordAndSendVoice(int seconds) throws Exception {
         if (isMediaActive()) {
             throw new Exception("通话进行中，麦克风被占用，无法录制语音消息");
         }
-        File wav = File.createTempFile("voice-", ".wav");
-        File rec = VoiceIO.record(seconds, wav);
-        if (rec != null) {
-            sendFile(rec, "VOICE");
-            rec.delete();
+        File dir = new File("received");
+        if (!dir.exists()) dir.mkdirs();
+        File out = new File(dir, "voice-" + System.currentTimeMillis() + ".wav");
+        File rec = VoiceIO.record(seconds, out);
+        if (rec == null) throw new Exception("没有采集到音频数据");
+        // 注意：不删除文件——发送方也要能回放自己发的语音
+        sendFile(rec, "VOICE");
+    }
+
+    // ---------- 可随时开始/停止的录音（Web 端"语音"按钮）----------
+
+    private VoiceIO.Recorder recorder;
+
+    /** 开始录音；通话中或已在录音时抛异常 */
+    public synchronized void startVoiceRecord() throws Exception {
+        if (isMediaActive()) {
+            throw new Exception("通话进行中，麦克风被占用，无法录制语音消息");
         }
+        if (recorder != null) {
+            throw new Exception("正在录音中");
+        }
+        VoiceIO.Recorder r = new VoiceIO.Recorder();
+        r.start();
+        recorder = r;
+    }
+
+    /** 停止录音并作为语音消息发出；返回保存的文件名 */
+    public synchronized String stopVoiceRecordAndSend() throws Exception {
+        if (recorder == null) {
+            throw new Exception("当前没有在录音");
+        }
+        VoiceIO.Recorder r = recorder;
+        recorder = null;
+        File dir = new File("received");
+        if (!dir.exists()) dir.mkdirs();
+        File out = new File(dir, "voice-" + System.currentTimeMillis() + ".wav");
+        File rec = r.stop(out);
+        if (rec == null) throw new Exception("没有采集到音频数据");
+        sendFile(rec, "VOICE");
+        return out.getName();
+    }
+
+    /** 是否正在录音 */
+    public boolean isRecording() {
+        return recorder != null;
+    }
+
+    /** 已录制的秒数 */
+    public double recordedSeconds() {
+        VoiceIO.Recorder r = recorder;
+        return r == null ? 0 : r.seconds();
     }
 
     /** 向被叫发送一条 SIP MESSAGE，body 为消息体原文 */
@@ -1302,6 +1371,11 @@ public class SipVideoCallClient implements SipListener {
         ringing.addHeader(headerFactory.createContactHeader(contactAddress));
         tx.sendResponse(ringing);
 
+        // 先看主叫 SDP 里有没有 m=video，决定本次是否带视频
+        byte[] offer = request.getRawContent();
+        String remoteSdp = (offer == null) ? "" : new String(offer, StandardCharsets.UTF_8);
+        videoCall = VIDEO_ENABLED && remoteSdp.contains("m=video");
+
         // 200 OK + 本机 SDP
         Response ok = messageFactory.createResponse(Response.OK, request);
         ok.addHeader(headerFactory.createContactHeader(contactAddress));
@@ -1365,7 +1439,7 @@ public class SipVideoCallClient implements SipListener {
                     System.out.println("✓ 对方接听! 通话建立成功!");
                     notifyCall("active", targetUser);
 
-                    if (dialog == null) {
+                    if (dialog == null && clientTransaction != null) {
                         dialog = clientTransaction.getDialog();
                     }
 

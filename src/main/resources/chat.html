@@ -88,6 +88,8 @@
   .composer button.primary:hover { background: #1d4ed8; }
   .composer button.call { background: #16a34a; color: #fff; }
   .composer button.hang { background: #dc2626; color: #fff; }
+  .composer button.rec { background: #dc2626; color: #fff; animation: pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity: .65; } }
   .hidden { display: none !important; }
 </style>
 </head>
@@ -121,9 +123,10 @@
       <input type="text" id="text" placeholder="输入消息，回车发送" autocomplete="off">
       <button class="primary" id="btnSend">发送</button>
       <button id="btnImg">图片</button>
-      <button id="btnVoice">语音</button>
+      <button id="btnVoice">🎤 录音</button>
       <button id="btnVideo">视频</button>
-      <button class="call" id="btnCall">呼叫</button>
+      <button class="call" id="btnCallVoice">语音通话</button>
+      <button class="call" id="btnCallVideo">视频通话</button>
       <button class="hang" id="btnHang">挂断</button>
       <input type="file" id="fImg" accept="image/*" class="hidden">
       <input type="file" id="fVideo" accept="video/*" class="hidden">
@@ -180,7 +183,6 @@ function setCallBanner(state, peer) {
   bar.className = "callbar" + (state === "active" ? " active" : "");
   const map = { calling: "正在呼叫 " + peer + " …", ringing: peer + " 振铃中 …", incoming: peer + " 来电，接听中 …", active: "通话中（与 " + peer + "）" };
   bar.textContent = map[state] || state;
-  if (state === "active") panel.className = "videopanel";
 }
 
 // ---- SSE 事件 ----
@@ -211,6 +213,8 @@ es.onmessage = ev => {
   } else if (d.t === "call") {
     setCallBanner(d.state, d.peer);
   } else if (d.t === "video") {
+    // 收到第一帧视频才显示画面区（纯语音通话不会显示）
+    if ($("videoPanel").classList.contains("hidden")) $("videoPanel").className = "videopanel";
     const img = d.local ? $("vLocal") : $("vRemote");
     img.src = d.img;
   }
@@ -267,9 +271,31 @@ function sendText() {
 
 $("btnSend").onclick = sendText;
 $("text").addEventListener("keydown", e => { if (e.key === "Enter") sendText(); });
-$("btnCall").onclick = () => post("/api/call");
+$("btnCallVoice").onclick = () => post("/api/call?video=0");
+$("btnCallVideo").onclick = () => post("/api/call?video=1");
 $("btnHang").onclick = () => post("/api/hangup");
-$("btnVoice").onclick = () => { sys("录音中（5 秒），请对着本机麦克风说话…"); post("/api/record?sec=5"); };
+
+// 语音消息：按下开始录音，再按停止并发送
+let recording = false, recTimer = null, recStart = 0;
+$("btnVoice").onclick = async () => {
+  if (!recording) {
+    const d = await post("/api/record/start");
+    if (!d || !d.ok) return;
+    recording = true;
+    recStart = Date.now();
+    $("btnVoice").classList.add("rec");
+    const tick = () => $("btnVoice").textContent = "⏹ 停止并发送 " + Math.floor((Date.now() - recStart) / 1000) + "s";
+    tick();
+    recTimer = setInterval(tick, 200);
+    sys("录音中，请对着运行本程序的电脑说话；再按一次按钮结束并发送");
+  } else {
+    clearInterval(recTimer);
+    recording = false;
+    $("btnVoice").textContent = "🎤 录音";
+    $("btnVoice").classList.remove("rec");
+    post("/api/record/stop");
+  }
+};
 
 $("btnImg").onclick = () => $("fImg").click();
 $("fImg").onchange = () => uploadFile($("fImg").files[0], "IMG");

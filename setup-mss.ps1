@@ -95,10 +95,16 @@ function Invoke-MssApi {
     return $body
 }
 
-# 判断接口返回是否表示"列表为空"（MSS 用 {"errorCode":-2} 表示没有记录）
+# 判断接口返回是否表示"列表为空"
+# - MSS 用 {"errorCode":-2} 表示没有记录
+# - 表为空时 localuser/list 可能直接返回 "fail"（非 JSON），也要当作空处理
+# - 空字符串同样按空处理
 function Test-NoRecord {
     param([string]$Json)
-    return ($Json -match '"errorCode"')
+    if ([string]::IsNullOrWhiteSpace($Json)) { return $true }
+    if ($Json -match '"errorCode"') { return $true }
+    if ($Json.Trim() -notmatch '^[\[\{]') { return $true }
+    return $false
 }
 
 function Write-Step  { param([string]$T) Write-Host "`n>>> $T" -ForegroundColor Cyan }

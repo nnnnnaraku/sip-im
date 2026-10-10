@@ -66,6 +66,8 @@ public class WebClientServer {
         server.createContext("/api/call", WebClientServer::handleCall);
         server.createContext("/api/hangup", WebClientServer::handleHangup);
         server.createContext("/api/record", WebClientServer::handleRecord);
+        server.createContext("/api/record/start", WebClientServer::handleRecordStart);
+        server.createContext("/api/record/stop", WebClientServer::handleRecordStop);
         server.createContext("/api/setpeer", WebClientServer::handleSetPeer);
         server.createContext("/files", WebClientServer::handleFiles);
         server.setExecutor(Executors.newFixedThreadPool(6));
@@ -214,14 +216,48 @@ public class WebClientServer {
         }
     }
 
+    /** 开始录音：POST /api/record/start */
+    private static void handleRecordStart(HttpExchange ex) {
+        try {
+            if (sip == null || !sip.isRegistered()) {
+                sendJson(ex, err("尚未注册成功"));
+                return;
+            }
+            sip.startVoiceRecord();
+            sendJson(ex, ok());
+        } catch (Exception e) {
+            sendJson(ex, err(e.getMessage()));
+        }
+    }
+
+    /** 停止录音并发送：POST /api/record/stop */
+    private static void handleRecordStop(HttpExchange ex) {
+        try {
+            if (sip == null) {
+                sendJson(ex, err("引擎未就绪"));
+                return;
+            }
+            String name = sip.stopVoiceRecordAndSend();
+            JsonObject o = ok();
+            o.addProperty("name", name);
+            sendJson(ex, o);
+        } catch (Exception e) {
+            sendJson(ex, err(e.getMessage()));
+        }
+    }
+
+    /** 呼叫：POST /api/call?video=1|0 （1=视频通话，0 或省略=语音通话） */
     private static void handleCall(HttpExchange ex) {
         try {
             if (sip == null || !sip.isRegistered()) {
                 sendJson(ex, err("尚未注册成功"));
                 return;
             }
-            sip.makeCall();
-            sendJson(ex, ok());
+            boolean video = "1".equals(param(ex.getRequestURI().getRawQuery(), "video"));
+            sip.makeCall(video);
+            JsonObject o = ok();
+            o.addProperty("video", video);
+            sendJson(ex, o);
         } catch (Exception e) {
             sendJson(ex, err("呼叫失败: " + e.getMessage()));
         }

@@ -104,4 +104,38 @@ public class VoiceIO {
             try { if (ais != null) ais.close(); } catch (Exception ignored) { }
         }
     }
+
+    /**
+     * 可随时停止的录音器：先 {@link #start()}，之后任意时刻 {@link #stop(File)} 结束并落盘。
+     * 用于网页端"按下开始、再按结束"的灵活语音消息。
+     */
+    public static class Recorder {
+        private final ByteArrayOutputStream pcm = new ByteArrayOutputStream();
+        private AudioCapture capture;
+
+        public void start() throws Exception {
+            capture = new AudioCapture();
+            capture.start((data, length) -> pcm.write(data, 0, length));
+            System.out.println("[录音] 开始，请对着麦克风说话...");
+        }
+
+        /** 停止并写成 WAV；没有采集到数据时返回 null */
+        public File stop(File outFile) {
+            if (capture != null) {
+                capture.stop();
+                capture = null;
+            }
+            byte[] data = pcm.toByteArray();
+            if (data.length == 0) {
+                System.err.println("录音失败：没有采集到数据（请检查系统默认录音设备）");
+                return null;
+            }
+            return writeWav(data, outFile);
+        }
+
+        /** 已录制的时长（秒） */
+        public double seconds() {
+            return pcm.size() / 2.0 / 8000.0;
+        }
+    }
 }
