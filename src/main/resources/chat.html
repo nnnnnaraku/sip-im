@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>即时通信 · Web 客户端</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font-family: "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+    background: #eef2f7; color: #0f172a; display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; gap: 18px; padding: 12px 20px; color: #fff;
+    background: linear-gradient(135deg, #1e3a8a, #2563eb);
+  }
+  header .brand { font-size: 17px; font-weight: 700; }
+  header .brand .sub { font-size: 12px; font-weight: 400; opacity: .8; margin-left: 6px; }
+  header .who { font-size: 13.5px; opacity: .95; }
+  header .who b { font-size: 14.5px; }
+  header .spacer { flex: 1; }
+  header .status { font-size: 12.5px; padding: 4px 12px; border-radius: 20px; background: rgba(255,255,255,.18); }
+  header .status.on { background: #16a34a; }
+  header .status.off { background: #dc2626; }
+
+  .app { flex: 1; display: flex; min-height: 0; }
+  aside {
+    width: 210px; background: #fff; border-right: 1px solid #e2e8f0; padding: 14px;
+    overflow-y: auto;
+  }
+  aside h3 { font-size: 13px; color: #64748b; margin: 0 0 10px; }
+  .contact {
+    display: flex; align-items: center; gap: 9px; padding: 8px 10px; border-radius: 9px;
+    cursor: pointer; font-size: 14px;
+  }
+  .contact:hover { background: #f1f5f9; }
+  .contact.active { background: #dbeafe; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: #cbd5e1; flex: none; }
+  .dot.on { background: #22c55e; }
+
+  main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+
+  .callbar {
+    padding: 9px 18px; font-size: 13.5px; color: #fff; background: #7c3aed;
+    display: flex; align-items: center; gap: 12px;
+  }
+  .callbar.active { background: #16a34a; }
+
+  .videopanel {
+    display: flex; gap: 12px; padding: 12px 18px; background: #0f172a;
+  }
+  .videopanel > div { flex: 1; text-align: center; }
+  .videopanel img {
+    width: 100%; max-height: 210px; object-fit: contain; background: #1e293b; border-radius: 8px;
+  }
+  .videopanel .cap { color: #94a3b8; font-size: 12px; margin-top: 5px; }
+
+  .chat { flex: 1; overflow-y: auto; padding: 16px 20px; }
+  .row { display: flex; margin-bottom: 12px; }
+  .row.out { justify-content: flex-end; }
+  .bubble {
+    max-width: 68%; padding: 9px 13px; border-radius: 13px; font-size: 14px; line-height: 1.5;
+    background: #fff; box-shadow: 0 1px 2px rgba(15,23,42,.09); word-break: break-word;
+  }
+  .row.out .bubble { background: #2563eb; color: #fff; }
+  .bubble .who { font-size: 11.5px; opacity: .6; margin-bottom: 3px; }
+  .bubble img, .bubble video { max-width: 260px; max-height: 200px; border-radius: 9px; display: block; }
+  .bubble audio { max-width: 240px; }
+  .bubble .tag { font-size: 12px; opacity: .75; }
+  .sys { text-align: center; color: #94a3b8; font-size: 12.5px; margin: 10px 0; }
+
+  .composer {
+    display: flex; gap: 8px; padding: 12px 18px; background: #fff; border-top: 1px solid #e2e8f0;
+    flex-wrap: wrap;
+  }
+  .composer input[type=text] {
+    flex: 1; min-width: 160px; padding: 10px 13px; font-size: 14px; border: 1px solid #cbd5e1;
+    border-radius: 9px; outline: none;
+  }
+  .composer input[type=text]:focus { border-color: #2563eb; }
+  .composer button {
+    padding: 10px 14px; font-size: 13.5px; border: none; border-radius: 9px; cursor: pointer;
+    background: #e2e8f0; color: #334155; font-weight: 600;
+  }
+  .composer button:hover { background: #cbd5e1; }
+  .composer button.primary { background: #2563eb; color: #fff; }
+  .composer button.primary:hover { background: #1d4ed8; }
+  .composer button.call { background: #16a34a; color: #fff; }
+  .composer button.hang { background: #dc2626; color: #fff; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">💬 即时通信<span class="sub">Web 客户端</span></div>
+  <div class="who">我 <b id="me">-</b> → 对端 <b id="peer">-</b></div>
+  <div class="spacer"></div>
+  <div class="status off" id="reg">连接中…</div>
+</header>
+
+<div class="app">
+  <aside>
+    <h3>联系人 / 在线状态</h3>
+    <div id="contacts"></div>
+  </aside>
+
+  <main>
+    <div class="callbar hidden" id="callbar"></div>
+
+    <div class="videopanel hidden" id="videoPanel">
+      <div><img id="vLocal" alt="本地"><div class="cap">本地画面</div></div>
+      <div><img id="vRemote" alt="对方"><div class="cap">对方画面</div></div>
+    </div>
+
+    <div class="chat" id="chat">
+      <div class="sys">欢迎使用即时通信 Web 客户端。左侧点选联系人，下方发送消息或发起通话。</div>
+    </div>
+
+    <div class="composer">
+      <input type="text" id="text" placeholder="输入消息，回车发送" autocomplete="off">
+      <button class="primary" id="btnSend">发送</button>
+      <button id="btnImg">图片</button>
+      <button id="btnVoice">语音</button>
+      <button id="btnVideo">视频</button>
+      <button class="call" id="btnCall">呼叫</button>
+      <button class="hang" id="btnHang">挂断</button>
+      <input type="file" id="fImg" accept="image/*" class="hidden">
+      <input type="file" id="fVideo" accept="video/*" class="hidden">
+    </div>
+  </main>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const chat = $("chat");
+let ME = "-", PEER = "-";
+
+function sys(text) {
+  const d = document.createElement("div");
+  d.className = "sys";
+  d.textContent = text;
+  chat.appendChild(d);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+function bubble(out, peer, inner) {
+  const row = document.createElement("div");
+  row.className = "row " + (out ? "out" : "in");
+  const b = document.createElement("div");
+  b.className = "bubble";
+  if (!out) {
+    const w = document.createElement("div");
+    w.className = "who";
+    w.textContent = peer || "";
+    b.appendChild(w);
+  }
+  if (typeof inner === "string") b.appendChild(document.createTextNode(inner));
+  else b.appendChild(inner);
+  row.appendChild(b);
+  chat.appendChild(row);
+  chat.scrollTop = chat.scrollHeight;
+}
+
+function setReg(on) {
+  const el = $("reg");
+  el.textContent = on ? "已注册" : "未注册";
+  el.className = "status " + (on ? "on" : "off");
+}
+
+function setCallBanner(state, peer) {
+  const bar = $("callbar");
+  const panel = $("videoPanel");
+  if (state === "ended") {
+    bar.className = "callbar hidden";
+    setTimeout(() => { panel.className = "videopanel hidden"; $("vLocal").src = ""; $("vRemote").src = ""; }, 1200);
+    sys("通话已结束");
+    return;
+  }
+  bar.className = "callbar" + (state === "active" ? " active" : "");
+  const map = { calling: "正在呼叫 " + peer + " …", ringing: peer + " 振铃中 …", incoming: peer + " 来电，接听中 …", active: "通话中（与 " + peer + "）" };
+  bar.textContent = map[state] || state;
+  if (state === "active") panel.className = "videopanel";
+}
+
+// ---- SSE 事件 ----
+const es = new EventSource("/api/stream");
+es.onmessage = ev => {
+  let d;
+  try { d = JSON.parse(ev.data); } catch (e) { return; }
+  if (d.t === "state") {
+    setReg(!!d.registered);
+    if (d.me) { ME = d.me; $("me").textContent = ME; }
+    if (d.peer) { PEER = d.peer; $("peer").textContent = PEER; }
+  } else if (d.t === "msg") {
+    bubble(d.out, d.peer, d.text);
+  } else if (d.t === "file") {
+    let el;
+    if (d.ftype === "IMG") { el = document.createElement("img"); el.src = d.url; }
+    else if (d.ftype === "VOICE") { el = document.createElement("audio"); el.controls = true; el.src = d.url; }
+    else if (d.ftype === "VIDEO") { el = document.createElement("video"); el.controls = true; el.src = d.url; }
+    else { el = document.createElement("span"); el.textContent = "文件: " + d.name; }
+    const label = { IMG: "图片", VOICE: "语音", VIDEO: "视频" }[d.ftype] || "文件";
+    const box = document.createElement("div");
+    box.appendChild(el);
+    const t = document.createElement("div");
+    t.className = "tag";
+    t.textContent = label + " · " + d.name;
+    box.appendChild(t);
+    bubble(d.out, d.peer, box);
+  } else if (d.t === "call") {
+    setCallBanner(d.state, d.peer);
+  } else if (d.t === "video") {
+    const img = d.local ? $("vLocal") : $("vRemote");
+    img.src = d.img;
+  }
+};
+es.onerror = () => setReg(false);
+
+// ---- 状态与联系人 ----
+async function loadState() {
+  try {
+    const d = await (await fetch("/api/state")).json();
+    setReg(!!d.registered);
+    ME = d.me; PEER = d.peer;
+    $("me").textContent = ME; $("peer").textContent = PEER;
+  } catch (e) { setReg(false); }
+}
+async function loadContacts() {
+  try {
+    const d = await (await fetch("/api/contacts")).json();
+    const box = $("contacts");
+    box.innerHTML = "";
+    (d.contacts || []).forEach(c => {
+      const el = document.createElement("div");
+      el.className = "contact" + (c.user === PEER ? " active" : "");
+      el.innerHTML = '<span class="dot ' + (c.online ? "on" : "") + '"></span><span>' + c.user + '</span>';
+      el.onclick = async () => {
+        await fetch("/api/setpeer?user=" + encodeURIComponent(c.user), { method: "POST" });
+        PEER = c.user; $("peer").textContent = PEER;
+        sys("已选择对端 " + PEER);
+        loadContacts();
+      };
+      box.appendChild(el);
+    });
+  } catch (e) { /* ignore */ }
+}
+
+// ---- 操作 ----
+async function post(url) {
+  try {
+    const r = await fetch(url, { method: "POST" });
+    const d = await r.json();
+    if (!d.ok) sys("⚠ " + (d.error || "操作失败"));
+    return d;
+  } catch (e) { sys("⚠ " + e.message); }
+}
+
+function sendText() {
+  const t = $("text").value.trim();
+  if (!t) return;
+  fetch("/api/send", { method: "POST", body: t })
+    .then(r => r.json())
+    .then(d => { if (!d.ok) sys("⚠ " + (d.error || "发送失败")); });
+  $("text").value = "";
+}
+
+$("btnSend").onclick = sendText;
+$("text").addEventListener("keydown", e => { if (e.key === "Enter") sendText(); });
+$("btnCall").onclick = () => post("/api/call");
+$("btnHang").onclick = () => post("/api/hangup");
+$("btnVoice").onclick = () => { sys("录音中（5 秒），请对着本机麦克风说话…"); post("/api/record?sec=5"); };
+
+$("btnImg").onclick = () => $("fImg").click();
+$("fImg").onchange = () => uploadFile($("fImg").files[0], "IMG");
+$("btnVideo").onclick = () => $("fVideo").click();
+$("fVideo").onchange = () => uploadFile($("fVideo").files[0], "VIDEO");
+
+function uploadFile(file, type) {
+  if (!file) return;
+  const url = "/api/file?type=" + type + "&name=" + encodeURIComponent(file.name);
+  sys("正在发送 " + file.name + " (" + Math.round(file.size / 1024) + " KB)…");
+  file.arrayBuffer().then(buf => fetch(url, { method: "POST", body: buf }))
+    .then(r => r.json())
+    .then(d => { if (!d.ok) sys("⚠ " + (d.error || "发送失败")); });
+}
+
+loadState();
+loadContacts();
+setInterval(loadState, 5000);
+setInterval(loadContacts, 5000);
+</script>
+</body>
+</html>
