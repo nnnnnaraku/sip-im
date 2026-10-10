@@ -138,13 +138,16 @@ if (-not $SkipExtensions) {
     }
 
     foreach ($ext in $exts) {
-        if ($existingNames -contains $ext) {
-            Write-Skip "分机 $ext 已存在"
+        # 注意：right_relay = "转发媒体流"（媒体中继）。
+        # 不设这个权限时，服务器不再中转 RTP，两端会尝试直连；
+        # 若两台电脑不在同一网段就会没声音、没画面。
+        $payload = '{"usrname":"' + $ext + '","usrpwd":"' + $ext + '","dialplan":"default","description":"","right_relay":1,"endjson":"yes"}'
+        $r = Invoke-MssApi -Session $session -Path '/dbajax/localuser/set' -Json $payload
+        if ($r -match '"errorCode":0') {
+            if ($existingNames -contains $ext) { Write-Ok "分机 $ext 已更新（含转发媒体流权限）" }
+            else { Write-Ok "分机 $ext 已创建（密码同用户名）" }
         } else {
-            $payload = '{"usrname":"' + $ext + '","usrpwd":"' + $ext + '","dialplan":"default","description":"","endjson":"yes"}'
-            $r = Invoke-MssApi -Session $session -Path '/dbajax/localuser/set' -Json $payload
-            if ($r -match '"errorCode":0') { Write-Ok "分机 $ext 已创建（密码同用户名）" }
-            else { Write-Bad "分机 $ext 创建返回: $r" }
+            Write-Bad "分机 $ext 返回: $r"
         }
     }
 } else {
