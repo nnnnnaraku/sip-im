@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>即时通信后台管理</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #f1f5f9; color: #0f172a;
+    font-family: "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+  }
+  header {
+    background: linear-gradient(135deg, #1e3a8a, #2563eb);
+    color: #fff; padding: 16px 26px; display: flex; align-items: center; gap: 14px;
+  }
+  header .title { font-size: 18px; font-weight: 700; }
+  header .spacer { flex: 1; }
+  header .meta { font-size: 12.5px; opacity: .92; }
+  header a.logout {
+    color: #fff; text-decoration: none; font-size: 13px; border: 1px solid rgba(255,255,255,.55);
+    padding: 5px 12px; border-radius: 7px;
+  }
+  header a.logout:hover { background: rgba(255,255,255,.15); }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 22px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; }
+  .card {
+    background: #fff; border-radius: 12px; padding: 16px 18px;
+    box-shadow: 0 1px 3px rgba(15,23,42,.08); border-left: 4px solid #2563eb;
+  }
+  .card.green { border-left-color: #16a34a; }
+  .card.amber { border-left-color: #d97706; }
+  .card.red   { border-left-color: #dc2626; }
+  .card.violet{ border-left-color: #7c3aed; }
+  .card .k { font-size: 12.5px; color: #64748b; }
+  .card .v { font-size: 26px; font-weight: 700; margin-top: 6px; }
+  section { margin-top: 22px; }
+  h2 { font-size: 15px; margin: 0 0 10px; color: #334155; }
+  table {
+    width: 100%; border-collapse: collapse; background: #fff; border-radius: 12px; overflow: hidden;
+    box-shadow: 0 1px 3px rgba(15,23,42,.08); font-size: 13.5px;
+  }
+  th, td { padding: 10px 14px; text-align: left; border-bottom: 1px solid #eef2f7; }
+  th { background: #f8fafc; color: #475569; font-weight: 600; font-size: 12.5px; }
+  tr:last-child td { border-bottom: none; }
+  .badge { display: inline-block; padding: 2px 9px; border-radius: 20px; font-size: 12px; font-weight: 600; }
+  .b-on { background: #dcfce7; color: #166534; }
+  .b-off { background: #e2e8f0; color: #475569; }
+  .b-busy { background: #fee2e2; color: #991b1b; }
+  .b-ring { background: #fef3c7; color: #92400e; }
+  .b-out { background: #dbeafe; color: #1e40af; }
+  .b-in { background: #f3e8ff; color: #6b21a8; }
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
+  @media (max-width: 860px) { .two { grid-template-columns: 1fr; } }
+  .empty { color: #94a3b8; padding: 18px; text-align: center; background: #fff; border-radius: 12px; font-size: 13px; }
+  .warn { background: #fef2f2; color: #b91c1c; padding: 12px 16px; border-radius: 10px; font-size: 13px; margin-bottom: 14px; }
+  .muted { color: #94a3b8; }
+</style>
+</head>
+<body>
+<header>
+  <div class="title">💬 即时通信系统 · 后台管理</div>
+  <div class="spacer"></div>
+  <div class="meta" id="meta">加载中…</div>
+  <a class="logout" href="/logout">退出</a>
+</header>
+
+<div class="wrap">
+  <div id="warn"></div>
+
+  <div class="cards">
+    <div class="card green"><div class="k">在线分机</div><div class="v" id="c-online">-</div></div>
+    <div class="card amber"><div class="k">通话中</div><div class="v" id="c-busy">-</div></div>
+    <div class="card red"><div class="k">离线分机</div><div class="v" id="c-offline">-</div></div>
+    <div class="card"><div class="k">会议室</div><div class="v" id="c-rooms">-</div></div>
+    <div class="card violet"><div class="k">通话总次数</div><div class="v" id="c-calls">-</div></div>
+    <div class="card violet"><div class="k">通话总时长(秒)</div><div class="v" id="c-dur">-</div></div>
+    <div class="card"><div class="k">消息总条数</div><div class="v" id="c-msgs">-</div></div>
+  </div>
+
+  <div class="two">
+    <section>
+      <h2>分机与在线状态（实时）</h2>
+      <table id="t-ext">
+        <thead><tr><th>分机</th><th>状态</th><th>IP 地址</th><th>客户端</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+    <section>
+      <h2>会议室</h2>
+      <table id="t-room">
+        <thead><tr><th>编号</th><th>描述</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+  </div>
+
+  <div class="two">
+    <section>
+      <h2>通话次数 · 按对端</h2>
+      <table id="t-peer">
+        <thead><tr><th>对端分机</th><th>次数</th><th>总时长(秒)</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+    <section>
+      <h2>消息统计 · 按类型</h2>
+      <table id="t-msg">
+        <thead><tr><th>类型</th><th>发送</th><th>接收</th><th>合计</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+  </div>
+
+  <section>
+    <h2>最近通话</h2>
+    <table id="t-recent">
+      <thead><tr><th>时间</th><th>方向</th><th>对端</th><th>时长(秒)</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <p class="muted" style="text-align:center;margin:26px 0;font-size:12px">
+    数据来源：分机/会议室来自 miniSIPServer；通话/消息统计来自本机 logs/events.tsv ｜ 每 5 秒自动刷新
+  </p>
+</div>
+
+<script>
+const STATE_TEXT = { "在线": "b-on", "离线": "b-off", "通话中": "b-busy", "振铃": "b-ring" };
+const MSG_LABEL = { TEXT: "文字", IMG: "图片", VOICE: "语音", VIDEO: "视频" };
+
+function setText(id, v) { document.getElementById(id).textContent = v; }
+
+function rows(tbodyId, html) {
+  const tb = document.querySelector("#" + tbodyId + " tbody");
+  tb.innerHTML = html || '<tr><td colspan="6" class="muted" style="text-align:center">暂无数据</td></tr>';
+}
+
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+async function refresh() {
+  let d;
+  try {
+    const r = await fetch("/api/summary", { cache: "no-store" });
+    if (r.status === 401) { location.href = "/"; return; }
+    d = await r.json();
+  } catch (e) {
+    document.getElementById("warn").innerHTML = '<div class="warn">无法连接后台服务：' + esc(e.message) + '</div>';
+    return;
+  }
+
+  document.getElementById("warn").innerHTML = d.serverOnline
+    ? ""
+    : '<div class="warn">⚠ 无法连接 miniSIPServer（' + esc(d.serverError || "未知错误") + '）：分机与会议室数据暂不可用，通话/消息统计仍正常。</div>';
+
+  setText("meta", "更新于 " + new Date().toLocaleTimeString("zh-CN"));
+  setText("c-online", d.extOnline);
+  setText("c-busy", d.extBusy);
+  setText("c-offline", d.extOffline);
+  setText("c-rooms", d.roomCount);
+  setText("c-calls", d.callTotal);
+  setText("c-dur", d.callDurationTotal);
+  setText("c-msgs", d.msgTotal);
+
+  rows("t-ext", (d.extensions || []).map(e =>
+    `<tr><td><b>${esc(e.user)}</b></td>
+         <td><span class="badge ${STATE_TEXT[e.state] || "b-off"}">${esc(e.state)}</span></td>
+         <td>${esc(e.addr) || '<span class="muted">-</span>'}</td>
+         <td>${esc(e.agent) || '<span class="muted">-</span>'}</td></tr>`).join(""));
+
+  rows("t-room", (d.rooms || []).map(r =>
+    `<tr><td>${esc(r.id)}</td><td>${esc(r.desc) || '<span class="muted">-</span>'}</td></tr>`)
+    .join(""), 2);
+
+  rows("t-peer", (d.callPerPeer || []).map(p =>
+    `<tr><td><b>${esc(p.peer)}</b></td><td>${p.count}</td><td>${p.duration}</td></tr>`).join(""));
+
+  rows("t-msg", (d.msgByType || []).map(m =>
+    `<tr><td>${MSG_LABEL[m.type] || m.type}</td><td>${m.out}</td><td>${m.in}</td>
+         <td><b>${m.out + m.in}</b></td></tr>`).join(""));
+
+  rows("t-recent", (d.recentCalls || []).map(c =>
+    `<tr><td>${esc(c.time)}</td>
+         <td><span class="badge ${c.dir === "OUT" ? "b-out" : "b-in"}">${c.dir === "OUT" ? "呼出" : "呼入"}</span></td>
+         <td>${esc(c.peer)}</td><td>${c.duration}</td></tr>`).join(""));
+}
+
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

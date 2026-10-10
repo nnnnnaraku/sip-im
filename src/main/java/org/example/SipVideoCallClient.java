@@ -56,6 +56,69 @@ public class SipVideoCallClient implements SipListener {
     private ClientTransaction inviteTransaction;
     private boolean isRegistered = false;
 
+    /** 当前通话的开始时间 / 对端 / 方向，用于通话结束时统计时长（0 表示当前无通话） */
+    private volatile long callStartMillis = 0;
+    private volatile String callPeer = "";
+    private volatile String callDirection = "";
+
+    /**
+     * UI 桥接回调。
+     * 命令行模式不设置（为 null）；Web 网页端会注入实现，把事件推送给浏览器。
+     */
+    public interface Ui {
+        /** 收到/发出文字消息 */
+        void onMessage(String peer, String text, boolean outgoing);
+
+        /** 收到/发出文件消息；type 为 IMG / VOICE / VIDEO，savedPath 为本地落盘路径 */
+        void onFile(String peer, String type, String name, String savedPath, boolean outgoing);
+
+        /** 通话状态变化：calling / ringing / incoming / active / ended */
+        void onCallState(String state, String peer);
+
+        /** 一帧视频（JPEG 原始字节）；local=true 为本地摄像头画面 */
+        void onVideoFrame(byte[] jpeg, boolean local);
+    }
+
+    private volatile Ui ui;
+
+    /** Web 模式注入 UI 回调 */
+    public void setUi(Ui ui) {
+        this.ui = ui;
+    }
+
+    /** 是否已注册成功（Web 端查询用） */
+    public boolean isRegistered() {
+        return isRegistered;
+    }
+
+    private void notifyMessage(String peer, String text, boolean outgoing) {
+        Ui u = this.ui;
+        if (u != null) {
+            try { u.onMessage(peer, text, outgoing); } catch (Exception ignore) { }
+        }
+    }
+
+    private void notifyFile(String peer, String type, String name, String path, boolean outgoing) {
+        Ui u = this.ui;
+        if (u != null) {
+            try { u.onFile(peer, type, name, path, outgoing); } catch (Exception ignore) { }
+        }
+    }
+
+    private void notifyCall(String state, String peer) {
+        Ui u = this.ui;
+        if (u != null) {
+            try { u.onCallState(state, peer); } catch (Exception ignore) { }
+        }
+    }
+
+    private void notifyVideo(byte[] jpeg, boolean local) {
+        Ui u = this.ui;
+        if (u != null) {
+            try { u.onVideoFrame(jpeg, local); } catch (Exception ignore) { }
+        }
+    }
+
     /** 文字消息的 CSeq 序号，每发一条递增 */
     private long messageCSeq = 1;
 
@@ -412,6 +475,16 @@ public class SipVideoCallClient implements SipListener {
         inviteTransaction.sendRequest();
 
         System.out.println("INVITE请求已发送到: " + targetUser);
+        markCallStart("OUT", targetUser);
+        notifyCall("calling", targetUser);
+    }
+
+    /** 记录通话开始（供后台统计） */
+    private void markCallStart(String direction, String peer) {
+        callStartMillis = System.currentTimeMillis();
+        callPeer = peer;
+        callDirection = direction;
+        EventLog.log("CALL_START", direction, peer, "");
     }
 
     // 带认证的INVITE
@@ -579,8 +652,11 @@ public class SipVideoCallClient implements SipListener {
             videoSocket = new DatagramSocket(videoLocalPort);
 
             videoReceiver = new RtpVideoReceiver(videoSocket, jpeg -> {
-                java.awt.image.BufferedImage img = VideoCodec.decode(jpeg);
-                if (img != null && videoWindow != null) videoWindow.updateRemote(img);
+                notifyVideo(jpeg, false);
+                if (videoWindow != null) {
+                    java.awt.image.BufferedImage img = VideoCodec.decode(jpeg);
+                    if (img != null) videoWindow.updateRemote(img);
+                }
             });
             videoReceiver.start();
 
@@ -598,8 +674,11 @@ public class SipVideoCallClient implements SipListener {
                 videoCapture = null;
             }
 
-            videoWindow = new VideoWindow(VIDEO_WIDTH, VIDEO_HEIGHT);
-            videoWindow.showWindow();
+            // 命令行模式弹出自带窗口；Web 模式画面由网页显示，不弹 Swing 窗口
+            if (ui == null) {
+                videoWindow = new VideoWindow(VIDEO_WIDTH, VIDEO_HEIGHT);
+                videoWindow.showWindow();
+            }
 
             videoRunning = true;
             startVideoLoop();
@@ -621,9 +700,10 @@ public class SipVideoCallClient implements SipListener {
                     if (videoCapture != null) {
                         java.awt.image.BufferedImage img = videoCapture.grab();
                         if (img != null) {
-                            videoWindow.updateLocal(img);
+                            if (videoWindow != null) videoWindow.updateLocal(img);
                             byte[] jpeg = VideoCodec.encode(img, VIDEO_QUALITY);
                             videoSender.sendFrame(jpeg);
+                            notifyVideo(jpeg, true);
                         }
                     } else {
                         Thread.sleep(interval); // 无摄像头：只收不发
@@ -727,6 +807,13 @@ public class SipVideoCallClient implements SipListener {
 
     // 停止媒体流
     private void stopMedia() {
+        // 通话结束：记录时长供后台统计
+        if (callStartMillis > 0) {
+            long durSec = (System.currentTimeMillis() - callStartMillis) / 1000;
+            EventLog.log("CALL_END", callDirection, callPeer, String.valueOf(durSec));
+            notifyCall("ended", callPeer);
+            callStartMillis = 0;
+        }
         System.out.println("\n停止音频流...");
         levelMonitorRunning = false;
         stopVideo();
@@ -799,7 +886,7 @@ public class SipVideoCallClient implements SipListener {
         System.out.println("ACK已发送");
     }
 
-    private void hangup() throws Exception {
+    public void hangup() throws Exception {
         if (dialog != null) {
             Request byeRequest = dialog.createRequest(Request.BYE);
             ClientTransaction byeTransaction = sipProvider.getNewClientTransaction(byeRequest);
@@ -814,6 +901,33 @@ public class SipVideoCallClient implements SipListener {
     /** 向被叫发送一条文字消息 */
     public void sendMessage(String text) throws Exception {
         sendRaw(text);
+        EventLog.log("MSG", "OUT", targetUser, "TEXT:" + text.length());
+        notifyMessage(targetUser, text, true);
+    }
+
+    /** 当前对端分机 */
+    public String getTargetUser() {
+        return targetUser;
+    }
+
+    /** 切换对端分机（Web 端点头像/联系人时用） */
+    public void setTargetUser(String user) {
+        if (user != null && !user.trim().isEmpty()) {
+            this.targetUser = user.trim();
+        }
+    }
+
+    /** 用本机麦克风录一段语音并作为语音消息发出（Web 端"语音"按钮用） */
+    public void recordAndSendVoice(int seconds) throws Exception {
+        if (isMediaActive()) {
+            throw new Exception("通话进行中，麦克风被占用，无法录制语音消息");
+        }
+        File wav = File.createTempFile("voice-", ".wav");
+        File rec = VoiceIO.record(seconds, wav);
+        if (rec != null) {
+            sendFile(rec, "VOICE");
+            rec.delete();
+        }
     }
 
     /** 向被叫发送一条 SIP MESSAGE，body 为消息体原文 */
@@ -871,6 +985,21 @@ public class SipVideoCallClient implements SipListener {
         return "文件";
     }
 
+    /** 从 From 头里取出分机号（如 sip:101@host → 101） */
+    private static String peerOf(FromHeader from) {
+        if (from == null) return "";
+        try {
+            javax.sip.address.URI uri = from.getAddress().getURI();
+            if (uri instanceof SipURI) {
+                String u = ((SipURI) uri).getUser();
+                if (u != null) return u;
+            }
+        } catch (Exception ignore) {
+            // 取不到就算了，不影响主流程
+        }
+        return "";
+    }
+
     /** 发送文件：读取 -> Base64 -> 分片 -> 逐条 MESSAGE 发出 */
     public void sendFile(File file, String type) throws Exception {
         if (!file.exists() || !file.isFile()) {
@@ -900,10 +1029,12 @@ public class SipVideoCallClient implements SipListener {
         }
 
         System.out.println(typeName(type) + "发送完成: " + file.getName() + "（共 " + total + " 片）");
+        EventLog.log("MSG", "OUT", targetUser, type + ":" + data.length);
+        notifyFile(targetUser, type, file.getName(), file.getAbsolutePath(), true);
     }
 
     /** 处理收到的文件分片，凑齐后解码落盘；语音消息额外自动播放 */
-    private void handleFileChunk(String body) {
+    private void handleFileChunk(String body, String peer) {
         String[] p = body.split("\\|", 7);
         if (p.length < 7) return;
 
@@ -952,6 +1083,8 @@ public class SipVideoCallClient implements SipListener {
             Files.write(out.toPath(), data);
             System.out.println("[收到" + typeName(type) + "] 已保存: " + out.getAbsolutePath()
                     + "  (" + data.length + " 字节, " + total + " 片)");
+            EventLog.log("MSG", "IN", peer, type + ":" + data.length);
+            notifyFile(peer, type, name, out.getAbsolutePath(), false);
 
             if ("VOICE".equals(type)) {
                 lastVoiceFile = out;
@@ -1120,12 +1253,15 @@ public class SipVideoCallClient implements SipListener {
                 }
                 byte[] raw = request.getRawContent();
                 String text = (raw == null) ? "" : new String(raw, StandardCharsets.UTF_8);
+                FromHeader msgFrom = (FromHeader) request.getHeader(FromHeader.NAME);
+                String peer = peerOf(msgFrom);
                 if (text.startsWith("#FILE|")) {
-                    handleFileChunk(text);
+                    handleFileChunk(text, peer);
                 } else {
-                    FromHeader msgFrom = (FromHeader) request.getHeader(FromHeader.NAME);
                     String from = (msgFrom != null) ? msgFrom.getAddress().toString() : "未知";
                     System.out.println("\n[收到消息] 来自 " + from + "：" + text);
+                    EventLog.log("MSG", "IN", peer, "TEXT:" + text.length());
+                    notifyMessage(peer, text, false);
                 }
                 Response response = messageFactory.createResponse(200, request);
                 serverTransaction.sendResponse(response);
@@ -1155,6 +1291,7 @@ public class SipVideoCallClient implements SipListener {
         FromHeader from = (FromHeader) request.getHeader(FromHeader.NAME);
         System.out.println("\n[来电] 来自 " + ((from != null) ? from.getAddress() : "未知")
                 + "，自动接听...");
+        notifyCall("incoming", peerOf(from));
 
         // Contact 头：告知对端本机的可达地址
         SipURI contactURI = addressFactory.createSipURI(username, localIp);
@@ -1178,6 +1315,8 @@ public class SipVideoCallClient implements SipListener {
             dialog = tx.getDialog();
         }
         System.out.println("✓ 已接听，通话建立成功!");
+        markCallStart("IN", peerOf(from));
+        notifyCall("active", peerOf(from));
 
         // 对端 SDP -> 建立媒体（音频 + 视频）
         byte[] raw = request.getRawContent();
@@ -1221,8 +1360,10 @@ public class SipVideoCallClient implements SipListener {
                     System.out.println("服务器正在处理呼叫...");
                 } else if (statusCode == Response.RINGING) {
                     System.out.println("对方振铃中...");
+                    notifyCall("ringing", targetUser);
                 } else if (statusCode == Response.OK) {
                     System.out.println("✓ 对方接听! 通话建立成功!");
+                    notifyCall("active", targetUser);
 
                     if (dialog == null) {
                         dialog = clientTransaction.getDialog();

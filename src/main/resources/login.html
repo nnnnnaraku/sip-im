@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>登录 · 即时通信后台管理</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    font-family: "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+    background: linear-gradient(135deg, #1e3a8a 0%, #2563eb 60%, #38bdf8 100%);
+    color: #0f172a;
+  }
+  .card {
+    width: 380px; background: #fff; border-radius: 16px; padding: 36px 32px;
+    box-shadow: 0 20px 50px rgba(15, 23, 42, .35);
+  }
+  .logo { font-size: 30px; text-align: center; }
+  h1 { font-size: 19px; text-align: center; margin: 12px 0 4px; }
+  .sub { text-align: center; color: #64748b; font-size: 13px; margin-bottom: 24px; }
+  label { display: block; font-size: 13px; color: #475569; margin-bottom: 6px; }
+  input[type=password] {
+    width: 100%; padding: 11px 13px; font-size: 15px; border: 1px solid #cbd5e1;
+    border-radius: 9px; outline: none; transition: border-color .15s;
+  }
+  input[type=password]:focus { border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37,99,235,.15); }
+  button {
+    width: 100%; margin-top: 18px; padding: 12px; font-size: 15px; cursor: pointer;
+    color: #fff; background: #2563eb; border: none; border-radius: 9px; font-weight: 600;
+    transition: background .15s;
+  }
+  button:hover { background: #1d4ed8; }
+  .err {
+    margin-top: 14px; padding: 9px 12px; border-radius: 8px; font-size: 13px;
+    color: #b91c1c; background: #fee2e2; text-align: center;
+  }
+  .hint { margin-top: 18px; text-align: center; color: #94a3b8; font-size: 12px; }
+</style>
+</head>
+<body>
+  <form class="card" method="post" action="/login">
+    <div class="logo">💬</div>
+    <h1>即时通信系统 · 后台管理</h1>
+    <div class="sub">SIP 客户端管理端</div>
+    <label for="password">管理员口令</label>
+    <input id="password" name="password" type="password" placeholder="请输入管理员口令" autofocus autocomplete="current-password">
+    <button type="submit">登 录</button>
+    <div class="err" id="err" style="display:none">口令错误，请重试</div>
+    <div class="hint">默认口令见 config.properties 的 admin.password</div>
+  </form>
+  <script>
+    if (location.search.indexOf("error=1") >= 0) {
+      document.getElementById("err").style.display = "block";
+    }
+  </script>
+</body>
+</html>
