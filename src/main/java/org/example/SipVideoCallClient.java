@@ -77,6 +77,8 @@ public class SipVideoCallClient implements SipListener {
     private static final int VOICE_DURATION_SEC = intCfg("im.voice.duration.sec", 5);
     /** 最近收到的语音消息文件，供 /play 重放 */
     private volatile File lastVoiceFile;
+    /** 最近收到的视频消息文件 */
+    private volatile File lastVideoFile;
 
     // ---------- 视频 ----------
     /** 是否启用视频（SDP 中带 m=video） */
@@ -857,7 +859,7 @@ public class SipVideoCallClient implements SipListener {
     // ---------- 文件消息（Base64 分片，走 SIP MESSAGE）----------
     //
     // 帧格式：#FILE|<类型>|<文件id>|<文件名Base64>|<片序号>|<总片数>|<Base64数据>
-    //   类型：IMG = 图片，VOICE = 语音消息（以后可扩展 VIDEO）
+    //   类型：IMG = 图片，VOICE = 语音消息，VIDEO = 视频消息
     // 说明：这是本项目自定义的应用层分片协议，只有本项目客户端之间可以互通
     //       （手机端 Linphone 不认识这个格式）。
 
@@ -865,6 +867,7 @@ public class SipVideoCallClient implements SipListener {
     private String typeName(String type) {
         if ("VOICE".equals(type)) return "语音消息";
         if ("IMG".equals(type)) return "图片";
+        if ("VIDEO".equals(type)) return "视频消息";
         return "文件";
     }
 
@@ -957,6 +960,25 @@ public class SipVideoCallClient implements SipListener {
                 Thread player = new Thread(() -> VoiceIO.play(out), "VoicePlay");
                 player.setDaemon(true);
                 player.start();
+            } else if ("VIDEO".equals(type)) {
+                lastVideoFile = out;
+                System.out.println("[视频消息] 正在用系统默认播放器打开...");
+                // 打开外部程序同样不能占用 SIP 事件线程
+                final File vf = out;
+                Thread opener = new Thread(() -> {
+                    try {
+                        if (java.awt.Desktop.isDesktopSupported()) {
+                            java.awt.Desktop.getDesktop().open(vf);
+                        } else {
+                            System.out.println("[视频消息] 当前环境不支持自动打开，请手动播放: "
+                                    + vf.getAbsolutePath());
+                        }
+                    } catch (Exception ex) {
+                        System.out.println("[视频消息] 自动打开失败，请手动播放: " + vf.getAbsolutePath());
+                    }
+                }, "VideoOpen");
+                opener.setDaemon(true);
+                opener.start();
             }
         } catch (Exception e) {
             System.err.println("文件保存失败: " + e.getMessage());
@@ -975,9 +997,10 @@ public class SipVideoCallClient implements SipListener {
     /** 启动控制台聊天：输入一行回车即发送，同时接收并显示对方消息 */
     private void startChat() {
         Thread t = new Thread(() -> {
-            System.out.println("\n===== 消息功能已就绪（文字 / 图片 / 语音）=====");
+            System.out.println("\n===== 消息功能已就绪（文字 / 图片 / 语音 / 视频）=====");
             System.out.println("输入内容后回车         → 发送文字给 " + targetUser);
             System.out.println("输入 /img <图片路径>    → 发送图片");
+            System.out.println("输入 /video <视频路径>  → 发送视频消息");
             System.out.println("输入 /rec [秒数]        → 录一段语音消息并发送（默认 "
                     + VOICE_DURATION_SEC + " 秒）");
             System.out.println("输入 /play              → 重放最近收到的语音消息");
@@ -1000,6 +1023,18 @@ public class SipVideoCallClient implements SipListener {
                             sendFile(new File(line.substring(5).trim()), "IMG");
                         } catch (Exception e) {
                             System.err.println("图片发送失败: " + e.getMessage());
+                        }
+                        continue;
+                    }
+                    if (line.startsWith("/video ")) {
+                        if (!isRegistered) {
+                            System.out.println("尚未注册成功，无法发送");
+                            continue;
+                        }
+                        try {
+                            sendFile(new File(line.substring(7).trim()), "VIDEO");
+                        } catch (Exception e) {
+                            System.err.println("视频发送失败: " + e.getMessage());
                         }
                         continue;
                     }

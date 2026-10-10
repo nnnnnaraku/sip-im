@@ -115,7 +115,9 @@ if not defined MAVEN_HOME set "MAVEN_HOME=<B 机的 Maven 路径>"
 sip.target.user=101
 ```
 
-启动 A 机客户端（或已运行时输入 `/call` 命令），A 机拨号 → 服务器路由到 B 机 → B 机自动接听 → 两端各弹出视频窗口，双向音视频建立。
+启动 A 机客户端。当 `call.auto.invite=true` 时，A 机启动后会自动向 `sip.target.user` 拨号 → 服务器路由到 B 机 → B 机自动接听 → 两端各弹出视频窗口，双向音视频建立。
+
+> 说明：客户端目前没有"运行时手动拨号"命令，A 机需在启动时自动呼叫（即 `call.auto.invite=true` 且 `sip.target.user` 已指向 B 机）。若 A 机已在运行，改完配置后重启即可。
 
 ---
 
