@@ -14,6 +14,9 @@ sipServer.txt
 config.properties
 config-*.properties
 
+# ---- 个人开工笔记（仅本地使用，不入库） ----
+开工检查清单.md
+
 # ---- 收到的图片/文件 ----
 received/
 
