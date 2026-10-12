@@ -18,7 +18,7 @@
    powershell -ExecutionPolicy Bypass -File setup-mss.ps1
 
  常用参数：
-   -ServerHost 10.122.253.186   服务器 IP（默认 127.0.0.1）
+   -ServerHost 192.168.1.10     服务器 IP（默认 127.0.0.1）
    -ServerPort 8080             Web 管理端口
    -AdminPassword 1234          管理员密码
    -RoomList 1,2                要创建的会议室编号（逗号分隔）

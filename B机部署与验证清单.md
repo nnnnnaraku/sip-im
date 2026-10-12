@@ -6,19 +6,22 @@
 
 | 角色 | 机器 | IP | 分机 |
 |---|---|---|---|
-| 服务器（miniSIPServer） | A 机 | `10.122.253.186` | 100 |
-| 客户端 | B 机 | `10.21.138.31` | 101 |
+| 服务器（miniSIPServer） | A 机 | `<A 机 IP>` | 100 |
+| 客户端 | B 机（本机） | `<B 机 IP>` | 101 |
 
-> ⚠️ **重要前提：A、B 目前不在同一网段**（`10.122.x` vs `10.21.x`）。
-> 这种情况下**两端无法直连媒体**，必须由服务器的**「转发媒体流」**功能中转 RTP。
+> ⚠️ **重要前提**：若 A、B **不在同一网段**，两端无法直连媒体，
+> 必须由服务器的 **「转发媒体流」** 功能中转 RTP。
 > 因此：① B 的 `sip.local.ip` 必须填对；② 服务器分机必须带「转发媒体流」权限（见第八节）。
 > 服务器管理员口令：`1234`
+>
+> 📌 文中 `<A 机 IP>` / `<B 机 IP>` 是**占位符**，请替换成**你自己**两台机器的实际 IP
+> （其中 `sip.server.ip` 与 `mss.web.host` 填 **A 机的 IP**）。
 
 ---
 
 ## 一、前置条件
 
-- [ ] B 机能 `ping 10.122.253.186` 通（已确认可通）
+- [ ] B 机能 `ping <A 机 IP>` 通
 - [ ] B 机已装 **JDK 8** 与 **Maven**
 
 ---
@@ -58,11 +61,11 @@ sip.username=101
 sip.password=101
 
 # ---------- SIP 服务器（A 机）----------
-sip.server.ip=10.122.253.186
+sip.server.ip=<A 机 IP>
 sip.server.port=5060
 
-# ---------- 本机（B 机自己的 IP，10.21 网段）----------
-sip.local.ip=10.21.138.31
+# ---------- 本机（B 机当前 IP，用 ipconfig 查）----------
+sip.local.ip=<B 机 IP>
 sip.local.port=5061
 sip.register.interval.sec=300
 
@@ -98,14 +101,14 @@ web.port=8081
 admin.port=8090
 admin.password=1234
 
-# ---------- 读 miniSIPServer 的在线状态/会议室 ----------
-mss.web.host=10.122.253.186
+# ---------- 读 miniSIPServer 的在线状态/会议室（填 A 机 IP）----------
+mss.web.host=<A 机 IP>
 mss.web.port=8080
 mss.web.password=1234
 ```
 
 **要点：**
-- `sip.local.ip` 必须是 **B 机当前 IP**（本例 `10.21.138.31`，用 `ipconfig` 核实），**不能填 127.0.0.1**
+- `sip.local.ip` 必须是 **B 机当前 IP**（用 `ipconfig` 核实），**不能填 127.0.0.1**
 - B 机 IP 一旦变化，这一行必须同步改，否则没声音/没画面
 - `call.auto.invite=false`：B 是被叫，不主动拨号
 
@@ -156,10 +159,10 @@ if not defined MAVEN_HOME set "MAVEN_HOME=D:\dev\apache-maven-3.9.16"
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
-| 左侧**没有联系人** | B 跨网段读不到 A 的 8080，或用了旧代码 | ① 先确认已 `git pull` 并重启；② 在 B 机执行 `Test-NetConnection 10.122.253.186 -Port 8080`，**TcpTestSucceeded 为 False** 就让 A 机开防火墙 TCP 8080 |
+| 左侧**没有联系人** | B 跨网段读不到 A 的 8080，或用了旧代码 | ① 先确认已 `git pull` 并重启；② 在 B 机执行 `Test-NetConnection <A 机 IP> -Port 8080`，**TcpTestSucceeded 为 False** 就让 A 机开防火墙 TCP 8080 |
 | 通话**没声音、没画面**（或单向可见） | 分机没有「转发媒体流」权限 → 服务器不中继；而 A/B 跨网段直连不通 | 在 **A 机** 跑 `setup-mss.ps1`（见第八节），这是**跨网段通话的关键** |
 | 有声音**没画面** | 摄像头被占用 / 选的是语音通话 | 关掉占用摄像头的程序；视频务必用「视频通话」按钮 |
-| 注册失败 | 服务器上分机 101 不存在 / 网络不通 | A 机跑 `setup-mss.ps1` 重建分机；`ping 10.122.253.186` |
+| 注册失败 | 服务器上分机 101 不存在 / 网络不通 | A 机跑 `setup-mss.ps1` 重建分机；`ping <A 机 IP>` |
 | B 机 IP 变化后失效 | `sip.local.ip` 没更新 | 改 `sip.local.ip` 为当前 IP 后重启 |
 | 中文乱码 | 终端编码 | 用 `run-web.bat` 启动（已内置 UTF-8） |
 

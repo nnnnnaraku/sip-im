@@ -6,8 +6,8 @@
 
 | 角色 | 机器 | IP | 分机 |
 |---|---|---|---|
-| **SIP 服务器**（miniSIPServer） | A 机 | `10.122.253.186` | 100 |
-| 客户端 | B 机 | `10.21.138.31` | 101 |
+| **SIP 服务器**（miniSIPServer） | A 机（本机） | `<A 机 IP>` | 100 |
+| 客户端 | B 机 | `<B 机 IP>` | 101 |
 
 > A 机一个顶三个角色：
 > ① **miniSIPServer 服务器**（注册、呼叫路由、媒体中继）
@@ -15,6 +15,8 @@
 > ③ **后台管理端**（Web 管理页面，浏览器 8090）
 >
 > ⚠️ 服务器管理员口令：`1234`
+>
+> 📌 文中 `<A 机 IP>` / `<B 机 IP>` 是**占位符**，请替换成**你自己**两台机器的实际 IP。
 
 ---
 
@@ -83,11 +85,11 @@ sip.username=100
 sip.password=100
 
 # ---------- SIP 服务器（就是本机）----------
-sip.server.ip=10.122.253.186
+sip.server.ip=<A 机 IP>
 sip.server.port=5060
 
-# ---------- 本机 ----------
-sip.local.ip=10.122.253.186
+# ---------- 本机（本机当前 IP，用 ipconfig 查）----------
+sip.local.ip=<A 机 IP>
 sip.local.port=5061
 sip.register.interval.sec=300
 
@@ -118,7 +120,7 @@ admin.port=8090
 admin.password=1234
 
 # ---------- 读 miniSIPServer 的在线状态/会议室（本机就填自身 IP）----------
-mss.web.host=10.122.253.186
+mss.web.host=<A 机 IP>
 mss.web.port=8080
 mss.web.password=1234
 ```

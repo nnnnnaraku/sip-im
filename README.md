@@ -110,20 +110,29 @@
   → 依赖分机的 **「转发媒体流」权限**（`setup-mss.ps1` 会自动配置）
 - 后台管理端只需在一台机器上开；它的**通话/消息统计只反映本机事件**
 
-### 3.1 实际部署参数
+### 3.1 部署参数（示例）
 
-| 项 | 值 |
+> ⚠️ 下表 IP 是**示例**，只为说明"每台电脑各有自己的 IP"。
+> **仓库作者调试时用的是作者自己的 IP；你自行部署请全部换成你自己两台机器的 IP。**
+
+| 项 | 值（占位/示例） |
 |---|---|
-| A 机（服务器 + 客户端 100 + 后台管理端） | IP：`10.122.253.186` |
-| B 机（客户端 101） | IP：`10.21.138.31` |
+| A 机（服务器 + 客户端 100 + 后台管理端） | `<A 机 IP>`，例 `192.168.1.10` |
+| B 机（客户端 101） | `<B 机 IP>`，例 `192.168.1.20` |
 | 服务器 SIP | A 机 `5060/UDP` |
 | 服务器 Web 管理 | A 机 `8080/TCP`，口令 `1234` |
 | 网页客户端 | 各机 `8081/TCP` |
 | 后台管理端 | A 机 `8090/TCP`，口令 `1234` |
 | 分机号 | A = `100`，B = `101` |
 
-> ⚠️ **IP 是每次开工最容易变的东西**，务必用 `ipconfig` / `Get-NetIPAddress` 重新核对，
-> 并与各自 `config.properties` 的 `sip.local.ip` 保持一致。
+> ⚠️ **IP 是每次开工最容易变的东西**：用 `ipconfig` / `Get-NetIPAddress` 核对，
+> 并保证 `config.properties` 的 `sip.local.ip` 就是本机当前 IP。
+> B 机的 `sip.server.ip` 与 `mss.web.host` 要填 **A 机的 IP**。
+
+> 📌 **关于代码里的默认 IP**：`SipVideoCallClient` 中 `sip.server.ip` / `sip.local.ip` 的**兜底默认值**
+> 是仓库作者本机的地址，**只有在缺少 `config.properties` 时才会用到**。
+> 正常部署请先 `copy config.properties.example config.properties`，再填**你自己**的 IP
+> （模板里用的是 `192.168.1.100` 这类通用示例）。
 
 ### 3.2 端口与防火墙
 
@@ -282,7 +291,7 @@ netstat -ano -p UDP | Select-String ":5060"     # SIP
 netstat -ano -p TCP | Select-String ":8080"     # 服务器 Web
 
 # 3) 与对端是否互通（把 IP 换成对方机器）
-Test-Connection -ComputerName 10.21.138.31 -Count 2
+Test-Connection -ComputerName <B 机 IP> -Count 2
 ```
 
 ### 7.5 IP 变了要改哪里
