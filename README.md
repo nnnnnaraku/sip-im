@@ -42,7 +42,7 @@
 
 ## 2. 技术选型与理由
 
-### 2.1 SIP 服务器：miniSIPServer（而非 Kamailio）
+### 2.1 SIP 服务器：miniSIPServer
 
 | 对比项 | miniSIPServer | Kamailio |
 |---|---|---|
