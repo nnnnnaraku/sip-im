@@ -2,6 +2,13 @@
 
 > 北京邮电大学《软件产品综合研发实践（阶段二）》分组 03
 > 一个用 **Java** 从零实现的即时通信系统：SIP 信令 + 自研 RTP 媒体 + 网页客户端 + Web 后台管理端。
+>
+> ⚠️ **自行部署前必读**：仓库里的 IP、分机号、口令都是**作者环境的示例值**。
+> 部署时请把 `config.properties.example` 复制为 `config.properties`，并改成**你自己的环境**：
+> - `sip.local.ip` → **运行本客户端这台机器的 IP**（`ipconfig` / `Get-NetIPAddress` 查看）
+> - `sip.server.ip` → **跑 miniSIPServer 那台机器的 IP**
+>
+> 详见第 3.1 节「部署参数」与第 7 节「快速开始」。
 
 ---
 
@@ -272,7 +279,10 @@ powershell -ExecutionPolicy Bypass -File setup-mss.ps1 -ServerHost 127.0.0.1 -Se
    ```powershell
    copy config.properties.example config.properties
    ```
-   关键项：`sip.username` / `sip.target.user` / **`sip.local.ip` 必须是本机真实 IP**
+   **模板里的 IP 是占位示例，必须换成你自己的**：
+   - `sip.local.ip` = **本机当前 IP**（`ipconfig` 查），不能填 `127.0.0.1`
+   - `sip.server.ip` = 跑 miniSIPServer 那台机的 IP
+   - `sip.username` = 本机分机号；`sip.target.user` = 对端分机号
 2. 双击 `run-web.bat`，等待出现 `✓ 注册成功!`
 3. 浏览器打开 **http://localhost:8081/**
 
