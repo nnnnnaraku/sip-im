@@ -110,6 +110,38 @@
   → 依赖分机的 **「转发媒体流」权限**（`setup-mss.ps1` 会自动配置）
 - 后台管理端只需在一台机器上开；它的**通话/消息统计只反映本机事件**
 
+### 3.1 实际部署参数
+
+| 项 | 值 |
+|---|---|
+| A 机（服务器 + 客户端 100 + 后台管理端） | IP：`10.122.253.186` |
+| B 机（客户端 101） | IP：`10.21.138.31` |
+| 服务器 SIP | A 机 `5060/UDP` |
+| 服务器 Web 管理 | A 机 `8080/TCP`，口令 `1234` |
+| 网页客户端 | 各机 `8081/TCP` |
+| 后台管理端 | A 机 `8090/TCP`，口令 `1234` |
+| 分机号 | A = `100`，B = `101` |
+
+> ⚠️ **IP 是每次开工最容易变的东西**，务必用 `ipconfig` / `Get-NetIPAddress` 重新核对，
+> 并与各自 `config.properties` 的 `sip.local.ip` 保持一致。
+
+### 3.2 端口与防火墙
+
+| 端口 | 协议 | 用途 | B 需要访问 A 吗 |
+|---|---|---|---|
+| 5060 | UDP | SIP 信令（注册/呼叫） | ✅ **必须** |
+| 8080 | TCP | 服务器 Web 管理（B 读在线联系人） | ✅ **必须** |
+| 5061 | UDP | 客户端 SIP 端口 | ❌ |
+| 8000 / 8020 | UDP | 客户端音视频端口 | ❌（媒体由服务器中继） |
+| 8081 | TCP | 网页客户端 | ❌（仅本机浏览器） |
+| 8090 | TCP | 后台管理端 | ❌（仅本机浏览器） |
+
+> 因为媒体走服务器中继，**B 只需要能访问 A 的 `5060/UDP` 与 `8080/TCP`**。
+> 若 B 的左侧联系人列表为空，多半是 `8080` 不通，在 **A 机（管理员身份）** 放行：
+> ```powershell
+> New-NetFirewallRule -DisplayName "miniSIPServer Web 8080" -Direction Inbound -Protocol TCP -LocalPort 8080 -Action Allow
+> ```
+
 ---
 
 ## 4. 功能实现现状
@@ -171,6 +203,10 @@ sipvideo/
         ├── login.html                 后台登录页
         └── log4j.properties           日志配置
 ```
+
+> 运行 / 构建时会自动生成以下文件（均已加入 `.gitignore`，可随时删除）：
+> `sipDebug.txt`、`sipServer.txt`（SIP 协议栈日志，可能几十 MB）、
+> `logs/`（后台统计数据源）、`received/`（收到的图片/语音/视频）、`target/`（构建产物）。
 
 ### 5.1 核心类职责
 
@@ -234,6 +270,34 @@ powershell -ExecutionPolicy Bypass -File setup-mss.ps1 -ServerHost 127.0.0.1 -Se
 ### 7.3 后台管理端（任选一台）
 
 双击 `run-admin.bat` → 浏览器打开 **http://localhost:8090/** → 口令 `1234`
+
+### 7.4 开工自检（每次开始前跑一遍）
+
+```powershell
+# 1) 本机 IP —— 要与 config.properties 的 sip.local.ip 一致
+Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '169.254*' -and $_.IPAddress -ne '127.0.0.1' } | Select-Object IPAddress,InterfaceAlias
+
+# 2) 服务器端口是否在监听（在 A 机执行）
+netstat -ano -p UDP | Select-String ":5060"     # SIP
+netstat -ano -p TCP | Select-String ":8080"     # 服务器 Web
+
+# 3) 与对端是否互通（把 IP 换成对方机器）
+Test-Connection -ComputerName 10.21.138.31 -Count 2
+```
+
+### 7.5 IP 变了要改哪里
+
+| 谁的 IP 变了 | 要改的配置 |
+|---|---|
+| **A 机 IP 变** | A 的 `sip.local.ip`、`sip.server.ip`；**以及 B 的** `sip.server.ip`、`mss.web.host` |
+| **B 机 IP 变** | 只需改 B 的 `sip.local.ip` |
+
+> ⚠️ `sip.local.ip` 填错的表现：能注册、能接通，但**没声音、没画面**。
+
+### 7.6 代码版本
+
+两台机器都执行 `git pull`，并用 `git log --oneline -1` 确认两边是**同一个提交**。
+（用了旧代码会出现：没有联系人、录音只能 5 秒、挂断后画面卡住等已修复的问题。）
 
 ---
 
@@ -312,6 +376,22 @@ powershell -ExecutionPolicy Bypass -File setup-mss.ps1 -ServerHost 127.0.0.1 -Se
 ---
 
 ## 11. 工程要点与踩坑记录
+
+### 11.1 现象 → 处理（速查）
+
+| 现象 | 根因 | 处理 |
+|---|---|---|
+| 通话**没声音 / 没画面 / 只能单向看见** | 分机缺**「转发媒体流」**权限，跨网段直连不通 | A 机跑 `setup-mss.ps1` |
+| B 的**左侧联系人列表为空** | B 连不到 A 的 `8080`，或 B 用了旧代码 | 放行 TCP 8080（见 3.2 节）；两台都 `git pull` |
+| **挂断后对方画面卡住** | 旧代码 `dialog` 跨通话未重置 | 两台都 `git pull` 到最新 |
+| 新呼叫返回 **`486 Busy Here`** | 服务器有**僵尸通话**（客户端异常退出未挂断） | 重启 miniSIPServer，再跑 `setup-mss.ps1` |
+| **注册失败** | 分机不存在 / 网络不通 | A 机跑 `setup-mss.ps1`；`ping` 服务器 |
+| 服务器**重启后分机全没了** | miniSIPServer 配置会丢（正常现象） | 重跑 `setup-mss.ps1` |
+| 后台页面报**「无法连接 miniSIPServer」** | `mss.web.host/port/password` 不对 | 核对 `config.properties` |
+| 后台**统计一直是 0** | 本机还没有通话/消息事件 | 先做一次通话或发一条消息 |
+| **中文乱码** | 终端 UTF-8 与 Java 默认 GBK 不一致 | 用 `run-web.bat` / `run.bat` 启动（已内置 UTF-8 参数） |
+
+### 11.2 开发中的问题与解决
 
 开发过程中遇到的问题与解决（供组员参考，也是报告素材）：
 
