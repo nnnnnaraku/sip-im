@@ -492,6 +492,22 @@ public class SipVideoCallClient implements SipListener {
         notifyCall("calling", targetUser);
     }
 
+    /**
+     * 呼叫任意号码：普通分机号（如 101），或会议室号码（如 *6*1）。
+     *
+     * <p>拨号后 {@code targetUser} 会切换为该号码，后续消息也随之发给它；
+     * 想恢复点对点聊天，在网页左侧重新点选联系人即可。
+     *
+     * @param video  true = 视频通话；false = 纯语音通话
+     * @param target 被叫号码
+     */
+    public void makeCall(boolean video, String target) throws Exception {
+        if (target != null && !target.trim().isEmpty()) {
+            this.targetUser = target.trim();
+        }
+        makeCall(video);
+    }
+
     /** 记录通话开始（供后台统计） */
     private void markCallStart(String direction, String peer) {
         callStartMillis = System.currentTimeMillis();
@@ -596,6 +612,12 @@ public class SipVideoCallClient implements SipListener {
 
     // 启动媒体流
     private void startMedia(String remoteSdp) {
+        if (rtpReceiver != null) {
+            // 已经在通话中：拨会议室时服务器还会回呼本机并再带一份 SDP，
+            // 若重复建流会二次绑定同一端口（BindException）。此处直接忽略。
+            System.out.println("媒体流已在运行，忽略重复的启动请求");
+            return;
+        }
         try {
             // 解析对方的SDP，获取IP和端口
             parseRemoteSDP(remoteSdp);

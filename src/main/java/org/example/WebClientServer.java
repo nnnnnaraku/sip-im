@@ -246,17 +246,20 @@ public class WebClientServer {
         }
     }
 
-    /** 呼叫：POST /api/call?video=1|0 （1=视频通话，0 或省略=语音通话） */
+    /** 呼叫：POST /api/call?video=1|0&target=号码（target 省略则呼叫当前对端） */
     private static void handleCall(HttpExchange ex) {
         try {
             if (sip == null || !sip.isRegistered()) {
                 sendJson(ex, err("尚未注册成功"));
                 return;
             }
-            boolean video = "1".equals(param(ex.getRequestURI().getRawQuery(), "video"));
-            sip.makeCall(video);
+            String query = ex.getRequestURI().getRawQuery();
+            boolean video = "1".equals(param(query, "video"));
+            String target = param(query, "target");
+            sip.makeCall(video, target);
             JsonObject o = ok();
             o.addProperty("video", video);
+            o.addProperty("target", sip.getTargetUser());
             sendJson(ex, o);
         } catch (Exception e) {
             sendJson(ex, err("呼叫失败: " + e.getMessage()));
