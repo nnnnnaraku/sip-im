@@ -57,6 +57,13 @@ video.quality.percent=50
 # 本机视频 RTP 端口。同一台机器上跑多个客户端时要改成不同值（如 8022）
 video.local.port=8020
 
+# ---------- 会议视频（多人视频） ----------
+# 拨 *6*N 进入会议室时，视频走这条应用层中继（miniSIPServer 会议室只做音频混音）。
+# 中继在"服务器那台机"上启动：run-video-relay.bat，默认 UDP 9100。
+# host 留空则自动使用 sip.server.ip（一般不用改）
+video.relay.host=
+video.relay.port=9100
+
 # ---------- 通话行为 ----------
 # 通话时长（秒），到时自动挂断
 call.duration.sec=180

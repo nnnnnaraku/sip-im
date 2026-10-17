@@ -106,6 +106,13 @@
     cursor: pointer; background: #16a34a; color: #fff; font-weight: 600;
   }
   .dialbar button:hover { background: #15803d; }
+
+  .confpanel {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    gap: 8px; padding: 10px 18px 0;
+  }
+  .confcell img { width: 100%; border-radius: 9px; display: block; background: #0f172a; }
+  .confcell .cap { font-size: 11.5px; color: #64748b; text-align: center; margin-top: 3px; }
   .hidden { display: none !important; }
 </style>
 </head>
@@ -130,6 +137,8 @@
       <div><img id="vLocal" alt="本地"><div class="cap">本地画面</div></div>
       <div><img id="vRemote" alt="对方"><div class="cap">对方画面</div></div>
     </div>
+
+    <div class="confpanel hidden" id="confPanel"></div>
 
     <div class="chat" id="chat">
       <div class="sys">欢迎使用即时通信 Web 客户端。左侧点选联系人，下方发送消息或发起通话。</div>
@@ -160,7 +169,7 @@
 <script>
 const $ = id => document.getElementById(id);
 const chat = $("chat");
-let ME = "-", PEER = "-";
+let ME = "-", PEER = "-", CONF = false;
 
 function sys(text) {
   const d = document.createElement("div");
@@ -200,12 +209,46 @@ function setCallBanner(state, peer) {
   if (state === "ended") {
     bar.className = "callbar hidden";
     setTimeout(() => { panel.className = "videopanel hidden"; $("vLocal").src = ""; $("vRemote").src = ""; }, 1200);
+    clearConf();
     sys("通话已结束");
     return;
   }
   bar.className = "callbar" + (state === "active" ? " active" : "");
   const map = { calling: "正在呼叫 " + peer + " …", ringing: peer + " 振铃中 …", incoming: peer + " 来电，接听中 …", active: "通话中（与 " + peer + "）" };
   bar.textContent = map[state] || state;
+}
+
+// ---- 会议多路视频 ----
+function upsertConf(name, src, isLocal) {
+  const panel = $("confPanel");
+  panel.className = "confpanel";
+  let cell = panel.querySelector('[data-user="' + name + '"]');
+  if (!cell) {
+    cell = document.createElement("div");
+    cell.className = "confcell";
+    cell.dataset.user = name;
+    const img = document.createElement("img");
+    img.alt = name;
+    cell.appendChild(img);
+    const cap = document.createElement("div");
+    cap.className = "cap";
+    cap.textContent = isLocal ? (name + "（我）") : name;
+    cell.appendChild(cap);
+    panel.appendChild(cell);
+  }
+  cell.querySelector("img").src = src;
+}
+
+function removeConf(name) {
+  const cell = $("confPanel").querySelector('[data-user="' + name + '"]');
+  if (cell) cell.remove();
+}
+
+function clearConf() {
+  CONF = false;
+  const panel = $("confPanel");
+  panel.className = "confpanel hidden";
+  panel.innerHTML = "";
 }
 
 // ---- SSE 事件 ----
@@ -236,10 +279,24 @@ es.onmessage = ev => {
   } else if (d.t === "call") {
     setCallBanner(d.state, d.peer);
   } else if (d.t === "video") {
+    if (CONF) { upsertConf("我", d.img, true); return; }
     // 收到第一帧视频才显示画面区（纯语音通话不会显示）
     if ($("videoPanel").classList.contains("hidden")) $("videoPanel").className = "videopanel";
     const img = d.local ? $("vLocal") : $("vRemote");
     img.src = d.img;
+  } else if (d.t === "conf") {
+    CONF = !!d.on;
+    if (CONF) {
+      $("confPanel").className = "confpanel";
+      $("videoPanel").className = "videopanel hidden";
+      sys("已进入会议室 " + d.room + "（多路视频）");
+    } else {
+      clearConf();
+    }
+  } else if (d.t === "cvideo") {
+    upsertConf(d.from, d.img, false);
+  } else if (d.t === "cvideo-left") {
+    removeConf(d.from);
   }
 };
 es.onerror = () => setReg(false);

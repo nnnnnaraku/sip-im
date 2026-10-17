@@ -77,6 +77,15 @@ public class SipVideoCallClient implements SipListener {
 
         /** 一帧视频（JPEG 原始字节）；local=true 为本地摄像头画面 */
         void onVideoFrame(byte[] jpeg, boolean local);
+
+        /** 会议模式下收到某位参与者的视频帧（from 为分机号） */
+        default void onConferenceFrame(String from, byte[] jpeg) { onVideoFrame(jpeg, false); }
+
+        /** 某位参与者离开会议视频房间 */
+        default void onConferencePeerLeft(String from) { }
+
+        /** 会议视频开启/关闭（网页据此切换多路画面布局） */
+        default void onConferenceState(boolean on, String room) { }
     }
 
     private volatile Ui ui;
@@ -116,6 +125,27 @@ public class SipVideoCallClient implements SipListener {
         Ui u = this.ui;
         if (u != null) {
             try { u.onVideoFrame(jpeg, local); } catch (Exception ignore) { }
+        }
+    }
+
+    private void notifyConferenceFrame(String from, byte[] jpeg) {
+        Ui u = this.ui;
+        if (u != null) {
+            try { u.onConferenceFrame(from, jpeg); } catch (Exception ignore) { }
+        }
+    }
+
+    private void notifyConferencePeerLeft(String from) {
+        Ui u = this.ui;
+        if (u != null) {
+            try { u.onConferencePeerLeft(from); } catch (Exception ignore) { }
+        }
+    }
+
+    private void notifyConferenceState(boolean on, String room) {
+        Ui u = this.ui;
+        if (u != null) {
+            try { u.onConferenceState(on, room); } catch (Exception ignore) { }
         }
     }
 
@@ -164,6 +194,14 @@ public class SipVideoCallClient implements SipListener {
     private volatile boolean videoRunning = false;
     /** 本次通话是否带视频（false = 纯语音通话） */
     private volatile boolean videoCall = false;
+
+    /** 会议视频（拨 *6*N 时启用；音频仍由 SIP 会议室混音） */
+    private volatile ConferenceVideo confVideo;
+    /** 当前会议房间号（*6*1 中的 1）；非会议通话为 null */
+    private volatile String conferenceRoom;
+    /** 会议视频中继地址（默认就是 SIP 服务器那台机） */
+    private static final String VIDEO_RELAY_HOST = cfg("video.relay.host", cfg("sip.server.ip", "127.0.0.1"));
+    private static final int VIDEO_RELAY_PORT = intCfg("video.relay.port", 9100);
 
     // 媒体组件
     private AudioCapture audioCapture;
@@ -447,6 +485,9 @@ public class SipVideoCallClient implements SipListener {
      * @param video true = 视频通话（SDP 带 m=video）；false = 纯语音通话
      */
     public void makeCall(boolean video) throws Exception {
+        // 拨 *6*N 视为进入会议室 N：音频走服务器会议室混音，视频走应用层中继
+        Matcher roomMatcher = Pattern.compile("^\\*6\\*(\\d+)$").matcher(targetUser);
+        this.conferenceRoom = roomMatcher.matches() ? roomMatcher.group(1) : null;
         this.videoCall = video && VIDEO_ENABLED;
         String fromSipAddress = "sip:" + username + "@" + serverIp;
         Address fromAddress = addressFactory.createAddress(fromSipAddress);
@@ -643,7 +684,8 @@ public class SipVideoCallClient implements SipListener {
 
             System.out.println("✓ 音频流已启动，可以开始通话！");
             startLevelMonitor();
-            startVideo();
+            if (conferenceRoom != null) startConferenceVideo();
+            else startVideo();
 
         } catch (Exception e) {
             System.err.println("启动媒体流失败: " + e.getMessage());
@@ -786,6 +828,48 @@ public class SipVideoCallClient implements SipListener {
     }
 
     /**
+     * 启动会议视频：加入与会议室号同名的视频房间。
+     * 音频仍走 SIP 会议室（服务器混音），视频走应用层中继，因此支持多人。
+     */
+    private void startConferenceVideo() {
+        if (!VIDEO_ENABLED) return;
+        final String room = conferenceRoom;
+        try {
+            confVideo = new ConferenceVideo(VIDEO_RELAY_HOST, VIDEO_RELAY_PORT,
+                    room, username, VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_FPS, VIDEO_QUALITY,
+                    new ConferenceVideo.Listener() {
+                        @Override
+                        public void onLocalFrame(byte[] jpeg) {
+                            notifyVideo(jpeg, true);
+                        }
+
+                        @Override
+                        public void onRemoteFrame(String from, byte[] jpeg) {
+                            notifyConferenceFrame(from, jpeg);
+                        }
+
+                        @Override
+                        public void onPeerLeft(String from) {
+                            notifyConferencePeerLeft(from);
+                        }
+                    });
+            confVideo.start();
+            notifyConferenceState(true, room);
+        } catch (Exception e) {
+            System.err.println("启动会议视频失败: " + e.getMessage());
+            stopConferenceVideo();
+        }
+    }
+
+    private void stopConferenceVideo() {
+        if (confVideo != null) {
+            confVideo.stop();
+            confVideo = null;
+            notifyConferenceState(false, conferenceRoom);
+        }
+    }
+
+    /**
      * 每 2 秒打印一次上下行音频电平，用于客观判断音频是否真的有内容（不靠人耳）。
      * 电平 = 16bit PCM 的绝对平均值，范围 0~32767：
      *   静音 ≈ 0~300    正常说话 ≈ 500~8000    越大越响
@@ -860,6 +944,8 @@ public class SipVideoCallClient implements SipListener {
         System.out.println("\n停止音频流...");
         levelMonitorRunning = false;
         stopVideo();
+        stopConferenceVideo();
+        conferenceRoom = null;
 
         // 先打印收发统计：用于判断音频是否真的双向流动（不依赖人耳）
         long sent = (rtpSender != null) ? rtpSender.getPacketsSent() : 0;

@@ -360,6 +360,33 @@ public class WebClientServer {
             o.addProperty("img", "data:image/jpeg;base64," + Base64.getEncoder().encodeToString(jpeg));
             broadcast(o);
         }
+
+        @Override
+        public void onConferenceFrame(String from, byte[] jpeg) {
+            if (CLIENTS.isEmpty()) return;
+            JsonObject o = new JsonObject();
+            o.addProperty("t", "cvideo");
+            o.addProperty("from", from);
+            o.addProperty("img", "data:image/jpeg;base64," + Base64.getEncoder().encodeToString(jpeg));
+            broadcast(o);
+        }
+
+        @Override
+        public void onConferencePeerLeft(String from) {
+            JsonObject o = new JsonObject();
+            o.addProperty("t", "cvideo-left");
+            o.addProperty("from", from);
+            broadcast(o);
+        }
+
+        @Override
+        public void onConferenceState(boolean on, String room) {
+            JsonObject o = new JsonObject();
+            o.addProperty("t", "conf");
+            o.addProperty("on", on);
+            o.addProperty("room", room);
+            broadcast(o);
+        }
     }
 
     private static final class SseClient {
