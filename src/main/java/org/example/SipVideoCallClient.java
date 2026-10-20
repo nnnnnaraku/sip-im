@@ -14,7 +14,6 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.security.MessageDigest;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.*;
 
 public class SipVideoCallClient implements SipListener {
@@ -54,7 +53,7 @@ public class SipVideoCallClient implements SipListener {
 
     private Dialog dialog;
     private ClientTransaction inviteTransaction;
-    private boolean isRegistered = false;
+    private volatile boolean isRegistered = false;
 
     /** 当前通话的开始时间 / 对端 / 方向，用于通话结束时统计时长（0 表示当前无通话） */
     private volatile long callStartMillis = 0;
@@ -71,6 +70,9 @@ public class SipVideoCallClient implements SipListener {
 
         /** 收到/发出文件消息；type 为 IMG / VOICE / VIDEO，savedPath 为本地落盘路径 */
         void onFile(String peer, String type, String name, String savedPath, boolean outgoing);
+
+        /** A rejected incoming file is never advertised as complete. */
+        default void onFileError(String peer, String reason) { }
 
         /** 通话状态变化：calling / ringing / incoming / active / ended */
         void onCallState(String state, String peer);
@@ -150,7 +152,7 @@ public class SipVideoCallClient implements SipListener {
     }
 
     /** 文字消息的 CSeq 序号，每发一条递增 */
-    private long messageCSeq = 1;
+    private final java.util.concurrent.atomic.AtomicLong messageCSeq = new java.util.concurrent.atomic.AtomicLong(1);
 
     /**
      * 文件分片大小（Base64 字符数），图片与语音消息共用。
@@ -159,12 +161,20 @@ public class SipVideoCallClient implements SipListener {
      * 因此这里保守取 800，保证加上约 300 字节 SIP 头后仍不分片。
      */
     private final int FILE_CHUNK_SIZE = intCfg("im.file.chunk.size", 800);
-    /** 文件重组缓冲：文件id -> 分片数组（未到达的位置为 null） */
-    private final Map<String, List<String>> fileChunks = new ConcurrentHashMap<>();
-    /** 文件名（Base64 编码）：文件id -> nameB64 */
-    private final Map<String, String> fileNames = new ConcurrentHashMap<>();
-    /** 文件类型：文件id -> IMG / VOICE */
-    private final Map<String, String> fileTypes = new ConcurrentHashMap<>();
+    private final ReceivedFileStore fileStore;
+    private final FileTransferReceiver fileReceiver;
+    private java.util.concurrent.ScheduledExecutorService fileCleanup;
+
+    public SipVideoCallClient() {
+        this(new ReceivedFileStore(java.nio.file.Paths.get("received")));
+    }
+
+    SipVideoCallClient(ReceivedFileStore fileStore) {
+        this.fileStore = java.util.Objects.requireNonNull(fileStore, "fileStore");
+        this.fileReceiver = new FileTransferReceiver(fileStore);
+    }
+
+    public ReceivedFileStore getFileStore() { return fileStore; }
 
     /** 语音消息默认时长（秒） */
     private static final int VOICE_DURATION_SEC = intCfg("im.voice.duration.sec", 5);
@@ -302,6 +312,8 @@ public class SipVideoCallClient implements SipListener {
 
     /** 停止媒体流并关闭 SIP 协议栈，释放本地端口 */
     public void shutdown() {
+        if (fileCleanup != null) fileCleanup.shutdownNow();
+        fileReceiver.close();
         try {
             stopMedia();
             if (sipStack != null) {
@@ -343,6 +355,7 @@ public class SipVideoCallClient implements SipListener {
 
         // 启动定时重新注册，避免 Expires 到期后失去联系
         startReRegister();
+        startFileCleanup();
     }
 
     /**
@@ -1051,16 +1064,14 @@ public class SipVideoCallClient implements SipListener {
 
     /** 用本机麦克风录一段固定时长的语音并发出（Web 端的快捷方式） */
     public void recordAndSendVoice(int seconds) throws Exception {
-        if (isMediaActive()) {
-            throw new Exception("通话进行中，麦克风被占用，无法录制语音消息");
-        }
-        File dir = new File("received");
-        if (!dir.exists()) dir.mkdirs();
-        File out = new File(dir, "voice-" + System.currentTimeMillis() + ".wav");
-        File rec = VoiceIO.record(seconds, out);
-        if (rec == null) throw new Exception("没有采集到音频数据");
-        // 注意：不删除文件——发送方也要能回放自己发的语音
-        sendFile(rec, "VOICE");
+        if (isMediaActive()) throw new Exception("通话进行中，麦克风被占用，无法录制语音消息");
+        if (seconds < 1 || seconds > 60) throw new IllegalArgumentException("录制时长需在1~60秒之间");
+        java.nio.file.Path temporary = Files.createTempFile("sip-voice-", ".wav");
+        try {
+            File recorded = VoiceIO.record(seconds, temporary.toFile());
+            if (recorded == null) throw new Exception("没有采集到音频数据");
+            keepAndSendRecording(recorded);
+        } finally { Files.deleteIfExists(temporary); }
     }
 
     // ---------- 可随时开始/停止的录音（Web 端"语音"按钮）----------
@@ -1082,18 +1093,29 @@ public class SipVideoCallClient implements SipListener {
 
     /** 停止录音并作为语音消息发出；返回保存的文件名 */
     public synchronized String stopVoiceRecordAndSend() throws Exception {
-        if (recorder == null) {
-            throw new Exception("当前没有在录音");
-        }
-        VoiceIO.Recorder r = recorder;
+        if (recorder == null) throw new Exception("当前没有在录音");
+        java.nio.file.Path temporary = Files.createTempFile("sip-voice-", ".wav");
+        VoiceIO.Recorder current = recorder;
         recorder = null;
-        File dir = new File("received");
-        if (!dir.exists()) dir.mkdirs();
-        File out = new File(dir, "voice-" + System.currentTimeMillis() + ".wav");
-        File rec = r.stop(out);
-        if (rec == null) throw new Exception("没有采集到音频数据");
-        sendFile(rec, "VOICE");
-        return out.getName();
+        try {
+            File recorded = current.stop(temporary.toFile());
+            if (recorded == null) throw new Exception("没有采集到音频数据");
+            return keepAndSendRecording(recorded).getOriginalName();
+        } finally { Files.deleteIfExists(temporary); }
+    }
+
+    private ReceivedFileStore.StoredFile keepAndSendRecording(File recorded) throws Exception {
+        ReceivedFileStore.StoredFile saved;
+        try (java.io.InputStream input = Files.newInputStream(recorded.toPath())) {
+            saved = fileStore.save("voice-" + UUID.randomUUID().toString() + ".wav", input);
+        }
+        try {
+            sendFile(saved.getPath().toFile(), "VOICE", saved.getOriginalName());
+            return saved;
+        } catch (Exception failure) {
+            try { fileStore.deleteOwned(saved); } catch (java.io.IOException cleanup) { failure.addSuppressed(cleanup); }
+            throw failure;
+        }
     }
 
     /** 是否正在录音 */
@@ -1109,11 +1131,15 @@ public class SipVideoCallClient implements SipListener {
 
     /** 向被叫发送一条 SIP MESSAGE，body 为消息体原文 */
     private void sendRaw(String body) throws Exception {
+        sendRaw(body, targetUser);
+    }
+
+    private void sendRaw(String body, String recipient) throws Exception {
         String fromSipAddress = "sip:" + username + "@" + serverIp;
         Address fromAddress = addressFactory.createAddress(fromSipAddress);
         FromHeader fromHeader = headerFactory.createFromHeader(fromAddress, String.valueOf(System.currentTimeMillis()));
 
-        String toSipAddress = "sip:" + targetUser + "@" + serverIp;
+        String toSipAddress = "sip:" + recipient + "@" + serverIp;
         Address toAddress = addressFactory.createAddress(toSipAddress);
         ToHeader toHeader = headerFactory.createToHeader(toAddress, null);
 
@@ -1122,10 +1148,10 @@ public class SipVideoCallClient implements SipListener {
         viaHeaders.add(viaHeader);
 
         CallIdHeader callIdHeader = sipProvider.getNewCallId();
-        CSeqHeader cSeqHeader = headerFactory.createCSeqHeader(messageCSeq++, Request.MESSAGE);
+        CSeqHeader cSeqHeader = headerFactory.createCSeqHeader(messageCSeq.getAndIncrement(), Request.MESSAGE);
         MaxForwardsHeader maxForwards = headerFactory.createMaxForwardsHeader(70);
 
-        SipURI requestURI = addressFactory.createSipURI(targetUser, serverIp);
+        SipURI requestURI = addressFactory.createSipURI(recipient, serverIp);
         requestURI.setPort(serverPort);
 
         Request request = messageFactory.createRequest(requestURI, Request.MESSAGE,
@@ -1177,126 +1203,87 @@ public class SipVideoCallClient implements SipListener {
         return "";
     }
 
-    /** 发送文件：读取 -> Base64 -> 分片 -> 逐条 MESSAGE 发出 */
+    /** Send a local file using the unchanged wire format and a fixed recipient. */
     public void sendFile(File file, String type) throws Exception {
-        if (!file.exists() || !file.isFile()) {
-            System.out.println("文件不存在: " + file.getAbsolutePath());
-            return;
-        }
-
-        byte[] data = Files.readAllBytes(file.toPath());
-        String b64 = Base64.getEncoder().encodeToString(data);
-        int total = (b64.length() + FILE_CHUNK_SIZE - 1) / FILE_CHUNK_SIZE;
-        String fileId = Long.toHexString(System.currentTimeMillis());
-        String nameB64 = Base64.getEncoder().encodeToString(
-                file.getName().getBytes(StandardCharsets.UTF_8));
-
-        System.out.println("开始发送" + typeName(type) + ": " + file.getName()
-                + "  |  原始 " + data.length + " 字节"
-                + " -> Base64 " + b64.length() + " 字符"
-                + " -> 分 " + total + " 片");
-
-        for (int i = 0; i < total; i++) {
-            int from = i * FILE_CHUNK_SIZE;
-            int to = Math.min(from + FILE_CHUNK_SIZE, b64.length());
-            String frame = "#FILE|" + type + "|" + fileId + "|" + nameB64 + "|" + i + "|" + total
-                    + "|" + b64.substring(from, to);
-            sendRaw(frame);
-            Thread.sleep(30); // 轻微限速，避免瞬间冲击服务器
-        }
-
-        System.out.println(typeName(type) + "发送完成: " + file.getName() + "（共 " + total + " 片）");
-        EventLog.log("MSG", "OUT", targetUser, type + ":" + data.length);
-        notifyFile(targetUser, type, file.getName(), file.getAbsolutePath(), true);
+        if (file == null) throw new IllegalArgumentException("FILE_REQUIRED");
+        sendFile(file, type, file.getName());
     }
 
-    /** 处理收到的文件分片，凑齐后解码落盘；语音消息额外自动播放 */
-    private void handleFileChunk(String body, String peer) {
-        String[] p = body.split("\\|", 7);
-        if (p.length < 7) return;
+    /** Upload storage names are private: the wire/UI retains the validated original display name. */
+    public void sendFile(File file, String type, String originalName) throws Exception {
+        if (file == null) throw new IllegalArgumentException("FILE_REQUIRED");
+        final String recipient = targetUser;
+        FileMessageSender.SentFile sent = FileMessageSender.send(file.toPath(), originalName, type,
+                FILE_CHUNK_SIZE, recipient, (to, frame) -> {
+                    sendRaw(frame, to);
+                    try { Thread.sleep(30); }
+                    catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw interrupted; }
+                });
+        System.out.println(typeName(type) + "分片已提交 SIP 发送（不代表对端完整接收），共 " + sent.getChunks() + " 片");
+        EventLog.log("MSG", "OUT", recipient, type + ":" + sent.getSize());
+        notifyFile(recipient, type, originalName, file.getAbsolutePath(), true);
+    }
 
-        String type = p[1];
-        String id = p[2];
-        String nameB64 = p[3];
-        int index, total;
-        try {
-            index = Integer.parseInt(p[4]);
-            total = Integer.parseInt(p[5]);
-        } catch (NumberFormatException e) {
-            return;
-        }
-        String chunk = p[6];
-        if (total <= 0 || index < 0 || index >= total) return;
+    private static boolean isFileFrame(byte[] raw) {
+        byte[] prefix = "#FILE|".getBytes(StandardCharsets.US_ASCII);
+        if (raw == null || raw.length < prefix.length) return false;
+        for (int i = 0; i < prefix.length; i++) if (raw[i] != prefix[i]) return false;
+        return true;
+    }
 
-        fileNames.putIfAbsent(id, nameB64);
-        fileTypes.putIfAbsent(id, type);
-        List<String> slots = fileChunks.computeIfAbsent(id,
-                k -> new ArrayList<>(Collections.nCopies(total, (String) null)));
-
-        synchronized (slots) {
-            if (index < slots.size()) slots.set(index, chunk);
-        }
-
-        if (index == 0) {
-            System.out.println("\n[" + typeName(type) + "接收中] id=" + id + "  共 " + total + " 片 ...");
-        }
-
-        // 检查是否已凑齐
-        StringBuilder sb = new StringBuilder();
-        synchronized (slots) {
-            for (String s : slots) {
-                if (s == null) return; // 还没收齐
-                sb.append(s);
+    private int receiveFileFrame(byte[] raw, String peer) {
+        FileTransferReceiver.Result result;
+        String prefix = new String(raw, 0, Math.min(raw.length, 256), StandardCharsets.US_ASCII);
+        if (raw.length > 8192) result = fileReceiver.rejectOversized(peer, prefix);
+        else {
+            try {
+                String text = StandardCharsets.UTF_8.newDecoder()
+                        .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+                        .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+                        .decode(java.nio.ByteBuffer.wrap(raw)).toString();
+                result = fileReceiver.accept(peer, text);
+            } catch (java.nio.charset.CharacterCodingException invalidUtf8) {
+                result = fileReceiver.rejectMalformed(peer, prefix);
             }
         }
-
-        try {
-            byte[] data = Base64.getDecoder().decode(sb.toString());
-            String name = new String(Base64.getDecoder().decode(fileNames.get(id)),
-                    StandardCharsets.UTF_8);
-            File dir = new File("received");
-            if (!dir.exists()) dir.mkdirs();
-            File out = new File(dir, name);
-            Files.write(out.toPath(), data);
-            System.out.println("[收到" + typeName(type) + "] 已保存: " + out.getAbsolutePath()
-                    + "  (" + data.length + " 字节, " + total + " 片)");
-            EventLog.log("MSG", "IN", peer, type + ":" + data.length);
-            notifyFile(peer, type, name, out.getAbsolutePath(), false);
-
+        if (result.getSipStatus() >= 300) {
+            System.err.println("[附件接收失败] " + result.getError());
+            Ui current = ui;
+            if (current != null) {
+                try { current.onFileError(peer, result.getError()); }
+                catch (RuntimeException failure) { System.err.println("File error UI failed: " + failure.getClass().getSimpleName()); }
+            }
+        } else if (result.isComplete()) {
+            ReceivedFileStore.StoredFile saved = result.getStoredFile();
+            File out = saved.getPath().toFile();
+            String type = result.getType();
+            EventLog.log("MSG", "IN", peer, type + ":" + saved.getSize());
+            notifyFile(peer, type, saved.getOriginalName(), out.getAbsolutePath(), false);
+            System.out.println("[附件接收完成] " + saved.getStorageName() + " bytes=" + saved.getSize()
+                    + " sha256=" + saved.getSha256());
             if ("VOICE".equals(type)) {
                 lastVoiceFile = out;
-                System.out.println("[语音消息] 自动播放中...（可用 /play 重放）");
-                // 播放会阻塞，必须放到独立线程，不能卡住 SIP 事件线程
                 Thread player = new Thread(() -> VoiceIO.play(out), "VoicePlay");
-                player.setDaemon(true);
-                player.start();
+                player.setDaemon(true); player.start();
             } else if ("VIDEO".equals(type)) {
                 lastVideoFile = out;
-                System.out.println("[视频消息] 正在用系统默认播放器打开...");
-                // 打开外部程序同样不能占用 SIP 事件线程
-                final File vf = out;
-                Thread opener = new Thread(() -> {
-                    try {
-                        if (java.awt.Desktop.isDesktopSupported()) {
-                            java.awt.Desktop.getDesktop().open(vf);
-                        } else {
-                            System.out.println("[视频消息] 当前环境不支持自动打开，请手动播放: "
-                                    + vf.getAbsolutePath());
-                        }
-                    } catch (Exception ex) {
-                        System.out.println("[视频消息] 自动打开失败，请手动播放: " + vf.getAbsolutePath());
-                    }
-                }, "VideoOpen");
-                opener.setDaemon(true);
-                opener.start();
+                // Never Desktop.open an untrusted VIDEO: the declared type could
+                // contain an executable. Web playback/manual opening stays available.
+                System.out.println("[视频消息] 已安全保存，请在网页中播放或自行确认后打开。");
             }
-        } catch (Exception e) {
-            System.err.println("文件保存失败: " + e.getMessage());
-        } finally {
-            fileChunks.remove(id);
-            fileNames.remove(id);
-            fileTypes.remove(id);
         }
+        return result.getSipStatus();
+    }
+
+    private synchronized void startFileCleanup() {
+        if (fileCleanup != null) return;
+        fileCleanup = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(task -> {
+            Thread thread = new Thread(task, "FileReceiveCleanup"); thread.setDaemon(true); return thread;
+        });
+        fileCleanup.scheduleWithFixedDelay(() -> {
+            try { fileReceiver.expire(); }
+            catch (RuntimeException failure) { System.err.println("File cleanup failed: " + failure.getClass().getSimpleName()); }
+        }, 30, 30, java.util.concurrent.TimeUnit.SECONDS);
     }
 
     /** 当前是否有媒体流在跑（即通话进行中） */
@@ -1372,12 +1359,7 @@ public class SipVideoCallClient implements SipListener {
                             continue;
                         }
                         try {
-                            File wav = File.createTempFile("voice-", ".wav");
-                            File rec = VoiceIO.record(sec, wav);
-                            if (rec != null) {
-                                sendFile(rec, "VOICE");
-                                rec.delete();
-                            }
+                            recordAndSendVoice(sec);
                         } catch (Exception e) {
                             System.err.println("语音消息发送失败: " + e.getMessage());
                         }
@@ -1429,12 +1411,14 @@ public class SipVideoCallClient implements SipListener {
                     serverTransaction = sipProvider.getNewServerTransaction(request);
                 }
                 byte[] raw = request.getRawContent();
-                String text = (raw == null) ? "" : new String(raw, StandardCharsets.UTF_8);
                 FromHeader msgFrom = (FromHeader) request.getHeader(FromHeader.NAME);
                 String peer = peerOf(msgFrom);
-                if (text.startsWith("#FILE|")) {
-                    handleFileChunk(text, peer);
+                if (isFileFrame(raw)) {
+                    int status = receiveFileFrame(raw, peer);
+                    serverTransaction.sendResponse(messageFactory.createResponse(status, request));
+                    return;
                 } else {
+                    String text = (raw == null) ? "" : new String(raw, StandardCharsets.UTF_8);
                     String from = (msgFrom != null) ? msgFrom.getAddress().toString() : "未知";
                     System.out.println("\n[收到消息] 来自 " + from + "：" + text);
                     EventLog.log("MSG", "IN", peer, "TEXT:" + text.length());
