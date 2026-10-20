@@ -95,8 +95,20 @@ mss.web.password=1234
 # 网页版聊天客户端（独立进程，用 run-web.bat 启动）
 # ============================================================
 
-# 网页客户端监听端口。浏览器访问 http://<本机IP>:<web.port>/
+# 网页客户端监听端口。默认仅本机访问 http://127.0.0.1:<web.port>/
 # 注意：不要和 admin.port(8090) 冲突
 web.port=8081
 
-
+# Web control is local-only by default. This does not change SIP/RTP binding.
+web.bind.address=127.0.0.1
+web.remote.enabled=false
+# Additional exact hostnames (no scheme, wildcard or port); optional, normally blank.
+web.allowed.hosts=
+# Generated at first authorized startup, owner-only. Each instance needs its own private token file.
+# NEVER put the token value in this file, URLs, screenshots or logs.
+web.auth.token.file=web-access.token
+# Remote access requires HTTPS and an existing private keystore/password file.
+# Paths only: no passwords in this public template. Both files require owner-only permissions.
+web.tls.keystore=
+web.tls.password.file=
+web.tls.keystore.type=PKCS12

@@ -4,6 +4,14 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
+import com.sun.net.httpserver.HttpsServer;
+import com.sun.net.httpserver.HttpsConfigurator;
+import com.sun.net.httpserver.HttpsParameters;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLParameters;
+import java.io.IOException;
+import java.util.concurrent.Semaphore;
+import java.util.function.BooleanSupplier;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -39,7 +47,6 @@ import java.util.concurrent.Executors;
 public class WebClientServer {
 
     private static final Properties CONFIG = loadConfig();
-    private static final int WEB_PORT = intCfg("web.port", 8081);
     private static final String MY_USER = cfg("sip.username", "100");
     private static final String PEER_USER = cfg("sip.target.user", "101");
     private static final String MSS_HOST = cfg("mss.web.host", cfg("sip.server.ip", "127.0.0.1"));
@@ -47,35 +54,33 @@ public class WebClientServer {
     private static final String MSS_PWD = cfg("mss.web.password", "1234");
 
     /** 复用的 miniSIPServer 客户端（在线联系人） */
-    private static final MssClient MSS = new MssClient(MSS_HOST, MSS_PORT, MSS_PWD);
+    private static volatile MssClient MSS = new MssClient(MSS_HOST, MSS_PORT, MSS_PWD);
 
     /** 已连接的浏览器 SSE 通道 */
     private static final Set<SseClient> CLIENTS = ConcurrentHashMap.newKeySet();
 
-    private static SipVideoCallClient sip;
+    private static volatile SipVideoCallClient sip;
+    private static Path RECEIVED_DIR = Paths.get("received");
+    private static final Semaphore SSE_SLOTS = new Semaphore(4);
 
     public static void main(String[] args) throws Exception {
-        // 1) 先起 Web 服务，页面能立刻打开（此时可能还没注册上）
-        HttpServer server = HttpServer.create(new InetSocketAddress(WEB_PORT), 0);
-        server.createContext("/", WebClientServer::handleRoot);
-        server.createContext("/api/stream", WebClientServer::handleStream);
-        server.createContext("/api/state", WebClientServer::handleState);
-        server.createContext("/api/contacts", WebClientServer::handleContacts);
-        server.createContext("/api/send", WebClientServer::handleSend);
-        server.createContext("/api/file", WebClientServer::handleFile);
-        server.createContext("/api/call", WebClientServer::handleCall);
-        server.createContext("/api/hangup", WebClientServer::handleHangup);
-        server.createContext("/api/record", WebClientServer::handleRecord);
-        server.createContext("/api/record/start", WebClientServer::handleRecordStart);
-        server.createContext("/api/record/stop", WebClientServer::handleRecordStop);
-        server.createContext("/api/setpeer", WebClientServer::handleSetPeer);
-        server.createContext("/files", WebClientServer::handleFiles);
-        server.setExecutor(Executors.newFixedThreadPool(6));
+        // Validate secrets and TLS before binding. Defaults expose the control service only on loopback.
+        WebServerSettings settings = WebServerSettings.from(CONFIG);
+        SSLContext tls = settings.loadSslContext();
+        String token = PrivateWebToken.loadOrCreate(settings.getTokenPath());
+        HttpServer server = createListener(settings, tls);
+        WebAccessControl access = new WebAccessControl(token, settings.getScheme(),
+                settings.authorities(server.getAddress().getPort()), !settings.isRemoteEnabled());
+        registerRoutes(server, access);
+        server.setExecutor(Executors.newFixedThreadPool(8));
         server.start();
 
         System.out.println("=====================================================");
         System.out.println("  网页版客户端已启动");
-        System.out.println("  访问地址: http://localhost:" + WEB_PORT + "/");
+        String host = settings.getBindAddress().getHostAddress();
+        if (host.indexOf(':') >= 0) host = "[" + host + "]";
+        System.out.println("  访问地址: " + settings.getScheme() + "://" + host + ":" + settings.getPort() + "/");
+        System.out.println("  登录令牌文件（仅本机读取，不要分享）: " + settings.getTokenPath());
         System.out.println("  本机账号: " + MY_USER + "    对端账号: " + PEER_USER);
         System.out.println("  按 Ctrl+C 退出");
         System.out.println("=====================================================");
@@ -87,8 +92,7 @@ public class WebClientServer {
                 sip.setUi(new UiBridge());
                 sip.init();
             } catch (Exception e) {
-                System.err.println("SIP 引擎启动失败: " + e.getMessage());
-                e.printStackTrace();
+                System.err.println("SIP 引擎启动失败，请检查本机 SIP 配置及诊断日志。");
             }
         }, "SipEngine");
         engine.setDaemon(true);
@@ -98,13 +102,64 @@ public class WebClientServer {
         new CountDownLatch(1).await();
     }
 
+    /** Construction helper used by isolated HTTP tests; does not initialize SIP or start a server. */
+    static HttpServer createListener(WebServerSettings settings, SSLContext tls) throws IOException {
+        return createListener(settings, tls, settings.getPort());
+    }
+
+    static HttpServer createListener(WebServerSettings settings, SSLContext tls, int port) throws IOException {
+        InetSocketAddress address = new InetSocketAddress(settings.getBindAddress(), port);
+        if ("https".equals(settings.getScheme()) != (tls != null)) {
+            throw new IllegalArgumentException("Listener TLS does not match configured scheme");
+        }
+        if (tls == null) return HttpServer.create(address, 0);
+        HttpsServer https = HttpsServer.create(address, 0);
+        https.setHttpsConfigurator(new HttpsConfigurator(tls) {
+            @Override public void configure(HttpsParameters parameters) {
+                SSLParameters ssl = tls.getDefaultSSLParameters();
+                ssl.setProtocols(new String[]{"TLSv1.2"});
+                parameters.setSSLParameters(ssl);
+            }
+        });
+        return https;
+    }
+
+    /** One guarded root dispatcher: future group/file routes must stay inside this boundary. */
+    static void registerRoutes(HttpServer server, WebAccessControl access) {
+        server.createContext("/", access.wrap(ex -> {
+            try {
+                String path = ex.getRequestURI().getPath();
+                switch (path) {
+                    case "/": handleRoot(ex); break;
+                    case "/web-access.js": serveResource(ex, "web-access.js", "application/javascript; charset=utf-8"); break;
+                    case "/api/stream": handleStream(ex, access); break;
+                    case "/api/state": handleState(ex); break;
+                    case "/api/contacts": handleContacts(ex); break;
+                    case "/api/send": handleSend(ex); break;
+                    case "/api/file": handleFile(ex); break;
+                    case "/api/call": handleCall(ex); break;
+                    case "/api/hangup": handleHangup(ex); break;
+                    case "/api/record": handleRecord(ex); break;
+                    case "/api/record/start": handleRecordStart(ex); break;
+                    case "/api/record/stop": handleRecordStop(ex); break;
+                    case "/api/setpeer": handleSetPeer(ex); break;
+                    default:
+                        if (path.startsWith("/files/")) handleFiles(ex);
+                        else sendText(ex, 404, "NOT_FOUND");
+                }
+            } catch (Exception failure) {
+                sendText(ex, 500, "REQUEST_FAILED");
+            }
+        }));
+    }
+
     // ---------------- 浏览器 -> 服务端 ----------------
 
     private static void handleRoot(HttpExchange ex) {
         try {
             serveResource(ex, "chat.html", "text/html; charset=utf-8");
         } catch (Exception e) {
-            sendText(ex, 500, "错误: " + e.getMessage());
+            sendText(ex, 500, "PAGE_UNAVAILABLE");
         }
     }
 
@@ -120,12 +175,14 @@ public class WebClientServer {
     private static void handleSetPeer(HttpExchange ex) {
         try {
             String user = param(ex.getRequestURI().getRawQuery(), "user");
-            if (sip != null) sip.setTargetUser(user);
+            requireUser(user);
+            if (sip == null) { sendJson(ex, 503, err("引擎未就绪")); return; }
+            sip.setTargetUser(user);
             JsonObject o = ok();
             o.addProperty("peer", sip != null ? sip.getTargetUser() : PEER_USER);
             sendJson(ex, o);
         } catch (Exception e) {
-            sendJson(ex, err("切换对端失败: " + e.getMessage()));
+            sendJson(ex, 400, err("切换对端失败，请检查分机号码"));
         }
     }
 
@@ -138,15 +195,12 @@ public class WebClientServer {
             }
             int sec = 5;
             String q = param(ex.getRequestURI().getRawQuery(), "sec");
-            if (q != null) {
-                try { sec = Integer.parseInt(q.trim()); } catch (Exception ignore) { }
-            }
-            if (sec < 1) sec = 1;
-            if (sec > 30) sec = 30;
+            if (q != null) sec = Integer.parseInt(q);
+            if (sec < 1 || sec > 30) throw new IllegalArgumentException("Invalid duration");
             sip.recordAndSendVoice(sec);
             sendJson(ex, ok());
         } catch (Exception e) {
-            sendJson(ex, err("录音失败: " + e.getMessage()));
+            sendJson(ex, 400, err("录音失败，请检查时长和音频设备"));
         }
     }
 
@@ -185,7 +239,7 @@ public class WebClientServer {
             sip.sendMessage(text);
             sendJson(ex, ok());
         } catch (Exception e) {
-            sendJson(ex, err("发送失败: " + e.getMessage()));
+            sendJson(ex, 500, err("消息发送失败"));
         }
     }
 
@@ -204,7 +258,7 @@ public class WebClientServer {
             name = sanitize(name);
 
             byte[] data = readBodyBytes(ex);
-            File dir = new File("received");
+            File dir = RECEIVED_DIR.toFile();
             if (!dir.exists()) dir.mkdirs();
             File out = new File(dir, name);
             Files.write(out.toPath(), data);
@@ -212,7 +266,7 @@ public class WebClientServer {
             sip.sendFile(out, type);
             sendJson(ex, ok());
         } catch (Exception e) {
-            sendJson(ex, err("文件发送失败: " + e.getMessage()));
+            sendJson(ex, 500, err("文件发送失败"));
         }
     }
 
@@ -226,7 +280,7 @@ public class WebClientServer {
             sip.startVoiceRecord();
             sendJson(ex, ok());
         } catch (Exception e) {
-            sendJson(ex, err(e.getMessage()));
+            sendJson(ex, 500, err("录音操作失败"));
         }
     }
 
@@ -242,7 +296,7 @@ public class WebClientServer {
             o.addProperty("name", name);
             sendJson(ex, o);
         } catch (Exception e) {
-            sendJson(ex, err(e.getMessage()));
+            sendJson(ex, 500, err("录音操作失败"));
         }
     }
 
@@ -254,15 +308,18 @@ public class WebClientServer {
                 return;
             }
             String query = ex.getRequestURI().getRawQuery();
-            boolean video = "1".equals(param(query, "video"));
+            String videoFlag = param(query, "video");
+            if (videoFlag != null && !videoFlag.equals("0") && !videoFlag.equals("1")) throw new IllegalArgumentException("Invalid video flag");
+            boolean video = "1".equals(videoFlag);
             String target = param(query, "target");
+            if (target != null) requireUser(target);
             sip.makeCall(video, target);
             JsonObject o = ok();
             o.addProperty("video", video);
             o.addProperty("target", sip.getTargetUser());
             sendJson(ex, o);
         } catch (Exception e) {
-            sendJson(ex, err("呼叫失败: " + e.getMessage()));
+            sendJson(ex, 400, err("呼叫失败，请检查分机号码和媒体状态"));
         }
     }
 
@@ -271,19 +328,25 @@ public class WebClientServer {
             if (sip != null) sip.hangup();
             sendJson(ex, ok());
         } catch (Exception e) {
-            sendJson(ex, err("挂断失败: " + e.getMessage()));
+            sendJson(ex, 500, err("挂断失败"));
         }
     }
 
     // ---------------- 服务端 -> 浏览器（SSE） ----------------
 
-    private static void handleStream(HttpExchange ex) {
+    private static void handleStream(HttpExchange ex, WebAccessControl access) {
+        if (!SSE_SLOTS.tryAcquire()) {
+            ex.getResponseHeaders().set("Retry-After", "15");
+            sendText(ex, 429, "TOO_MANY_STREAMS");
+            return;
+        }
+        SseClient client = null;
         try {
             ex.getResponseHeaders().set("Content-Type", "text/event-stream; charset=utf-8");
-            ex.getResponseHeaders().set("Cache-Control", "no-cache");
+            ex.getResponseHeaders().set("Cache-Control", "no-store");
             ex.getResponseHeaders().set("Connection", "keep-alive");
             ex.sendResponseHeaders(200, 0);
-            SseClient client = new SseClient(ex.getResponseBody());
+            client = new SseClient(ex.getResponseBody(), () -> access.isAuthenticated(ex));
             CLIENTS.add(client);
             // 立即回一条 state，让页面知道自己连上了
             JsonObject hello = new JsonObject();
@@ -298,8 +361,10 @@ public class WebClientServer {
                 client.send(": ping\n\n");
             }
         } catch (Exception e) {
-            // 浏览器断开，正常
+            if (e instanceof InterruptedException) Thread.currentThread().interrupt();
         } finally {
+            if (client != null) { CLIENTS.remove(client); client.close(); }
+            SSE_SLOTS.release();
             ex.close();
         }
     }
@@ -391,12 +456,15 @@ public class WebClientServer {
 
     private static final class SseClient {
         private final OutputStream out;
+        private final BooleanSupplier authorized;
 
-        SseClient(OutputStream out) {
+        SseClient(OutputStream out, BooleanSupplier authorized) {
             this.out = out;
+            this.authorized = authorized;
         }
 
         synchronized void send(String data) throws Exception {
+            if (!authorized.getAsBoolean()) { close(); throw new IOException("SESSION_EXPIRED"); }
             out.write(data.getBytes(StandardCharsets.UTF_8));
             out.flush();
         }
@@ -416,13 +484,23 @@ public class WebClientServer {
         try {
             String path = ex.getRequestURI().getPath();
             String name = sanitize(path.substring(path.lastIndexOf('/') + 1));
-            File f = new File(new File("received"), name);
+            File f = RECEIVED_DIR.resolve(name).toFile();
             if (!f.exists() || !f.isFile()) {
-                sendText(ex, 404, "文件不存在: " + name);
+                sendText(ex, 404, "文件不存在");
                 return;
             }
             byte[] body = Files.readAllBytes(f.toPath());
-            ex.getResponseHeaders().set("Content-Type", guessType(name));
+            String contentType = guessType(name);
+            ex.getResponseHeaders().set("Content-Type", contentType);
+            if ("application/octet-stream".equals(contentType)) {
+                ex.getResponseHeaders().set("Content-Disposition", "attachment");
+            }
+            if ("HEAD".equals(ex.getRequestMethod())) {
+                ex.getResponseHeaders().set("Content-Length", Integer.toString(body.length));
+                ex.sendResponseHeaders(200, -1);
+                ex.close();
+                return;
+            }
             ex.sendResponseHeaders(200, body.length);
             try (OutputStream os = ex.getResponseBody()) {
                 os.write(body);
@@ -460,11 +538,13 @@ public class WebClientServer {
         }
     }
 
-    private static void sendJson(HttpExchange ex, JsonObject o) {
+    private static void sendJson(HttpExchange ex, JsonObject o) { sendJson(ex, 200, o); }
+
+    private static void sendJson(HttpExchange ex, int status, JsonObject o) {
         try {
             byte[] body = o.toString().getBytes(StandardCharsets.UTF_8);
             ex.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
-            ex.sendResponseHeaders(200, body.length);
+            ex.sendResponseHeaders(status, body.length);
             try (OutputStream os = ex.getResponseBody()) {
                 os.write(body);
             }
@@ -515,20 +595,32 @@ public class WebClientServer {
 
     private static String param(String query, String key) {
         if (query == null) return null;
-        for (String kv : query.split("&")) {
+        String result = null;
+        for (String kv : query.split("&", -1)) {
             int i = kv.indexOf('=');
-            if (i > 0 && kv.substring(0, i).equals(key)) {
-                try {
-                    return java.net.URLDecoder.decode(kv.substring(i + 1), "UTF-8");
-                } catch (Exception e) {
-                    return kv.substring(i + 1);
+            if (i <= 0) throw new IllegalArgumentException("Invalid query");
+            try {
+                String name = java.net.URLDecoder.decode(kv.substring(0, i), "UTF-8");
+                String value = java.net.URLDecoder.decode(kv.substring(i + 1), "UTF-8");
+                if (value.indexOf('\0') >= 0 || value.indexOf('\r') >= 0 || value.indexOf('\n') >= 0)
+                    throw new IllegalArgumentException("Invalid query value");
+                if (name.equals(key)) {
+                    if (result != null) throw new IllegalArgumentException("Duplicate query parameter");
+                    result = value;
                 }
+            } catch (java.io.UnsupportedEncodingException impossible) {
+                throw new IllegalStateException(impossible);
             }
         }
-        return null;
+        return result;
     }
 
-    /** 只保留文件名，去掉任何路径分隔符，防止目录穿越 */
+    private static void requireUser(String user) {
+        if (user == null || !user.matches("[A-Za-z0-9_.+*\\-]{1,64}"))
+            throw new IllegalArgumentException("Invalid SIP user");
+    }
+
+    /** Legacy filename handling; receive/storage hardening lives in the independent file-security change. */
     private static String sanitize(String name) {
         String n = name.replace('\\', '/');
         int i = n.lastIndexOf('/');

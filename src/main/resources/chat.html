@@ -113,6 +113,12 @@
   }
   .confcell img { width: 100%; border-radius: 9px; display: block; background: #0f172a; }
   .confcell .cap { font-size: 11.5px; color: #64748b; text-align: center; margin-top: 3px; }
+  .access-panel { margin: 24px auto; padding: 24px; max-width: 540px; background: white; border-radius: 12px; }
+  .access-panel h2 { font-size: 18px; }
+  .access-panel p { font-size: 14px; line-height: 1.6; }
+  .access-panel input { width: 100%; padding: 10px; margin-bottom: 12px; }
+  .access-panel button { padding: 9px 18px; cursor: pointer; }
+  #accessError { color: #b91c1c; }
   .hidden { display: none !important; }
 </style>
 </head>
@@ -121,10 +127,21 @@
   <div class="brand">💬 即时通信<span class="sub">Web 客户端</span></div>
   <div class="who">我 <b id="me">-</b> → 对端 <b id="peer">-</b></div>
   <div class="spacer"></div>
-  <div class="status off" id="reg">连接中…</div>
+  <div class="status off" id="reg">请先登录</div>
+  <button id="btnLogout" class="hidden">退出 Web 会话</button>
 </header>
 
-<div class="app">
+<section class="access-panel" id="accessPanel">
+  <h2>本实例 Web 访问验证</h2>
+  <p>从本实例私有 <code>web-access.token</code> 读取访问令牌。令牌仅用于登录，不会保存到浏览器存储或 URL。请不要分享令牌。</p>
+  <form id="accessForm">
+    <label for="accessToken">访问令牌</label>
+    <input id="accessToken" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" required maxlength="512">
+    <button id="btnLogin" type="submit">登录</button>
+  </form>
+  <p id="accessError" role="status"></p>
+</section>
+<div class="app hidden" id="chatApp">
   <aside>
     <h3>联系人 / 在线状态</h3>
     <div id="contacts"></div>
@@ -166,10 +183,15 @@
   </main>
 </div>
 
+<script src="/web-access.js"></script>
 <script>
 const $ = id => document.getElementById(id);
 const chat = $("chat");
 let ME = "-", PEER = "-", CONF = false;
+const securedFetch = (input, options) => WebAccess.fetch(input, options);
+const conferenceCells = new Map();
+let es = null, stateTimer = null, contactsTimer = null, streamRetry = null;
+let uiGeneration = 0;
 
 function sys(text) {
   const d = document.createElement("div");
@@ -222,11 +244,11 @@ function setCallBanner(state, peer) {
 function upsertConf(name, src, isLocal) {
   const panel = $("confPanel");
   panel.className = "confpanel";
-  let cell = panel.querySelector('[data-user="' + name + '"]');
+  let cell = conferenceCells.get(name);
   if (!cell) {
     cell = document.createElement("div");
     cell.className = "confcell";
-    cell.dataset.user = name;
+    conferenceCells.set(name, cell);
     const img = document.createElement("img");
     img.alt = name;
     cell.appendChild(img);
@@ -240,20 +262,27 @@ function upsertConf(name, src, isLocal) {
 }
 
 function removeConf(name) {
-  const cell = $("confPanel").querySelector('[data-user="' + name + '"]');
+  const cell = conferenceCells.get(name);
   if (cell) cell.remove();
+  conferenceCells.delete(name);
 }
 
 function clearConf() {
   CONF = false;
   const panel = $("confPanel");
   panel.className = "confpanel hidden";
-  panel.innerHTML = "";
+  panel.textContent = "";
+  conferenceCells.clear();
 }
 
 // ---- SSE 事件 ----
-const es = new EventSource("/api/stream");
-es.onmessage = ev => {
+function connectStream() {
+  if (!WebAccess.isAuthenticated() || es) return;
+  const ticket = uiGeneration;
+  const current = new EventSource("/api/stream");
+  es = current;
+  current.onmessage = ev => {
+  if (ticket !== uiGeneration || !WebAccess.isAuthenticated()) return;
   let d;
   try { d = JSON.parse(ev.data); } catch (e) { return; }
   if (d.t === "state") {
@@ -299,28 +328,52 @@ es.onmessage = ev => {
     removeConf(d.from);
   }
 };
-es.onerror = () => setReg(false);
+  current.onerror = () => {
+    if (es !== current) return;
+    current.close();
+    es = null;
+    if (ticket !== uiGeneration) return;
+    setReg(false);
+    streamRetry = setTimeout(async () => {
+      streamRetry = null;
+      if (ticket !== uiGeneration) return;
+      if (await WebAccess.init()) connectStream();
+    }, 1500);
+  };
+}
 
 // ---- 状态与联系人 ----
 async function loadState() {
+  if (!WebAccess.isAuthenticated()) return;
+  const ticket = uiGeneration;
   try {
-    const d = await (await fetch("/api/state")).json();
+    const d = await (await securedFetch("/api/state")).json();
+    if (ticket !== uiGeneration || !WebAccess.isAuthenticated()) return;
     setReg(!!d.registered);
     ME = d.me; PEER = d.peer;
     $("me").textContent = ME; $("peer").textContent = PEER;
-  } catch (e) { setReg(false); }
+  } catch (e) { if (ticket === uiGeneration && WebAccess.isAuthenticated()) setReg(false); }
 }
 async function loadContacts() {
+  if (!WebAccess.isAuthenticated()) return;
+  const ticket = uiGeneration;
   try {
-    const d = await (await fetch("/api/contacts")).json();
+    const d = await (await securedFetch("/api/contacts")).json();
+    if (ticket !== uiGeneration || !WebAccess.isAuthenticated()) return;
     const box = $("contacts");
-    box.innerHTML = "";
+    box.textContent = "";
     (d.contacts || []).forEach(c => {
       const el = document.createElement("div");
       el.className = "contact" + (c.user === PEER ? " active" : "");
-      el.innerHTML = '<span class="dot ' + (c.online ? "on" : "") + '"></span><span>' + c.user + '</span>';
+      const dot = document.createElement("span");
+      dot.className = "dot " + (c.online ? "on" : "");
+      const user = document.createElement("span");
+      user.textContent = String(c.user || "");
+      el.appendChild(dot);
+      el.appendChild(user);
       el.onclick = async () => {
-        await fetch("/api/setpeer?user=" + encodeURIComponent(c.user), { method: "POST" });
+        const result = await (await securedFetch("/api/setpeer?user=" + encodeURIComponent(c.user), { method: "POST" })).json();
+        if (!result.ok || !WebAccess.isAuthenticated()) return;
         PEER = c.user; $("peer").textContent = PEER;
         sys("已选择对端 " + PEER);
         loadContacts();
@@ -333,7 +386,7 @@ async function loadContacts() {
 // ---- 操作 ----
 async function post(url) {
   try {
-    const r = await fetch(url, { method: "POST" });
+    const r = await securedFetch(url, { method: "POST" });
     const d = await r.json();
     if (!d.ok) sys("⚠ " + (d.error || "操作失败"));
     return d;
@@ -341,11 +394,13 @@ async function post(url) {
 }
 
 function sendText() {
+  if (!WebAccess.isAuthenticated()) return;
   const t = $("text").value.trim();
   if (!t) return;
-  fetch("/api/send", { method: "POST", body: t })
+  securedFetch("/api/send", { method: "POST", body: t })
     .then(r => r.json())
-    .then(d => { if (!d.ok) sys("⚠ " + (d.error || "发送失败")); });
+    .then(d => { if (!d.ok) sys("⚠ " + (d.error || "发送失败")); })
+    .catch(() => sys("⚠ 发送失败，请检查登录与连接状态"));
   $("text").value = "";
 }
 
@@ -374,7 +429,7 @@ let recording = false, recTimer = null, recStart = 0;
 $("btnVoice").onclick = async () => {
   if (!recording) {
     const d = await post("/api/record/start");
-    if (!d || !d.ok) return;
+    if (!d || !d.ok || !WebAccess.isAuthenticated()) return;
     recording = true;
     recStart = Date.now();
     $("btnVoice").classList.add("rec");
@@ -397,18 +452,60 @@ $("btnVideo").onclick = () => $("fVideo").click();
 $("fVideo").onchange = () => uploadFile($("fVideo").files[0], "VIDEO");
 
 function uploadFile(file, type) {
-  if (!file) return;
+  if (!file || !WebAccess.isAuthenticated()) return;
   const url = "/api/file?type=" + type + "&name=" + encodeURIComponent(file.name);
   sys("正在发送 " + file.name + " (" + Math.round(file.size / 1024) + " KB)…");
-  file.arrayBuffer().then(buf => fetch(url, { method: "POST", body: buf }))
+  file.arrayBuffer().then(buf => securedFetch(url, { method: "POST", body: buf }))
     .then(r => r.json())
-    .then(d => { if (!d.ok) sys("⚠ " + (d.error || "发送失败")); });
+    .then(d => { if (!d.ok) sys("⚠ " + (d.error || "发送失败")); })
+    .catch(() => sys("⚠ 发送失败，请检查登录与连接状态"));
 }
 
-loadState();
-loadContacts();
-setInterval(loadState, 5000);
-setInterval(loadContacts, 5000);
+function updateAccess(on) {
+  ++uiGeneration;
+  if (es) { es.close(); es = null; }
+  clearInterval(stateTimer); clearInterval(contactsTimer); clearTimeout(streamRetry);
+  stateTimer = contactsTimer = streamRetry = null;
+  $("chatApp").className = "app" + (on ? "" : " hidden");
+  $("accessPanel").className = "access-panel" + (on ? " hidden" : "");
+  $("btnLogout").className = on ? "" : "hidden";
+  if (!on) {
+    clearInterval(recTimer); recTimer = null; recording = false;
+    $("btnVoice").textContent = "🎤 录音";
+    $("btnVoice").classList.remove("rec");
+    $("contacts").textContent = "";
+    $("videoPanel").className = "videopanel hidden";
+    $("vLocal").removeAttribute("src"); $("vRemote").removeAttribute("src");
+    $("callbar").className = "callbar hidden";
+    clearConf();
+    ME = PEER = "-";
+    $("me").textContent = $("peer").textContent = "-";
+    $("reg").textContent = "请先登录";
+    $("reg").className = "status off";
+    return;
+  }
+  $("accessError").textContent = "";
+  loadState(); loadContacts(); connectStream();
+  stateTimer = setInterval(loadState, 5000);
+  contactsTimer = setInterval(loadContacts, 5000);
+}
+$("accessForm").addEventListener("submit", async ev => {
+  ev.preventDefault();
+  const token = $("accessToken").value.trim();
+  $("accessToken").value = "";
+  $("btnLogin").disabled = true;
+  $("accessError").textContent = "";
+  try { await WebAccess.login(token); }
+  catch (e) { $("accessError").textContent = "登录失败，请检查本实例访问令牌与连接。"; }
+  finally { $("btnLogin").disabled = false; }
+});
+$("btnLogout").onclick = async () => {
+  if (recording) await post("/api/record/stop");
+  try { await WebAccess.logout(); } catch (e) { /* local session is cleared even if disconnected */ }
+};
+WebAccess.onChanged(updateAccess);
+updateAccess(false);
+WebAccess.init();
 </script>
 </body>
 </html>

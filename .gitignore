@@ -40,3 +40,10 @@ run*.log
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Web control secrets: never version private tokens or TLS material
+web-access*.token
+*.p12
+*.pfx
+*.jks
+web-tls*.password

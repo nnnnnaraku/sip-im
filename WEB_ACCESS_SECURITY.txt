@@ -1,0 +1,204 @@
+WEB CLIENT ACCESS CONTROL — independent change
+Base: main 1cc201761921ddb668f159741c87df5ace7d35b6
+Branch: fix/web-access-control
+Worktree: D:\Projects\sip-im-web-security
+This branch contains no audio P0, group-chat, file-security or video-diagnostics implementation.
+
+1. What changed
+The previous HttpServer bound every interface; API/SSE/received files had no authentication.
+Dial, hangup, recording and send handlers accepted methods without a unified boundary.
+No shared CSRF, Host, cross-origin or body limit protected the controls.
+The contacts UI inserted untrusted SIP user names with innerHTML.
+
+The single root dispatcher is now wrapped in WebAccessControl:
+- Loopback 127.0.0.1 by default; actual remote peer must be loopback in local mode.
+- Public GET / and /web-access.js contain no credentials or client state.
+- Every /api/* and /files/* route requires a private capability login and session.
+- Login: POST /api/session/login; application/json; X-SIP-Login: 1; JSON token in BODY.
+- GET /api/session restores the session and returns its CSRF token to same-origin JavaScript.
+- POST /api/session/logout requires the session cookie and X-SIP-CSRF.
+- Mutating controls require POST + authenticated cookie + matching X-SIP-CSRF.
+- Origin (when present), Host and Sec-Fetch-Site are checked independently of authentication.
+  Omitting or forging Origin never substitutes for credentials/CSRF.
+- No CORS authorization, wildcard Host, proxy/forwarded-header trust or URL credentials.
+- Unknown API prefixes/suffixes are denied; old HttpServer prefix-handler fallthrough removed.
+- URI <=2048 chars; application header budget 16KiB.
+- Text <=16KiB UTF-8; file upload <=16MiB; login <=1024 bytes;
+  future group JSON <=4096 bytes; remaining controls/read endpoints accept no body.
+- Ambiguous Content-Length/Transfer-Encoding, bad UTF-8 and malformed session JSON rejected.
+- HttpOnly, SameSite=Strict cookies; HTTPS adds Secure. Cookie name includes Web port.
+- 30-minute idle / 8-hour absolute session lifetime, 8 sessions per process.
+  SSE checks validity on every event and heartbeat; heartbeat does not renew idle lifetime.
+- Login attempts: 10 per peer / 5 min, 50 process-wide / 5 min; peer table bounded.
+- SSE capped at 4 streams so the 8-worker pool still has capacity for controls.
+- no-store, nosniff, no-referrer, DENY framing and restrictive same-origin CSP.
+- Error responses no longer echo underlying SIP/file exception details.
+- Contact labels use textContent. Conference UI uses Map rather than untrusted selectors.
+
+2. Configuration and first login
+Use an independent PRIVATE run directory and its existing SIP configuration; do not overwrite
+a tested release/configuration. This change does not alter SIP/RTP/media/server ports.
+In that private configuration:
+  web.port=8081
+  web.bind.address=127.0.0.1
+  web.remote.enabled=false
+  web.allowed.hosts=
+  web.auth.token.file=web-access.token
+  web.tls.keystore=
+  web.tls.password.file=
+  web.tls.keystore.type=PKCS12
+
+First authorized WebClientServer startup creates the token at the configured path,
+using CREATE_NEW and owner-only ACL (Windows) or 0600 (POSIX).
+The parent directory must already exist and be trusted, with no junction/symlink aliases.
+Existing invalid/wide-permission/token files are rejected, never silently overwritten.
+The console prints the token FILE PATH, never its value. Open that private file locally,
+paste its one line into the login form, then close the editor. Do not paste it into
+chat, terminal commands, evidence screenshots, public configs or source files.
+The page clears the password input; it stores neither access nor CSRF tokens in localStorage,
+sessionStorage, URLs or logs. Keep one spelling of the origin (127.0.0.1 or localhost)
+during a session. Cookies are host scoped: these two names have separate login state.
+
+Local multi-instance example (private directories, not automatically created here):
+  A: web.port=8081; web.auth.token.file=web-access-100.token
+  B: web.port=8082; web.auth.token.file=web-access-101.token
+  C: web.port=8083; web.auth.token.file=web-access-102.token
+Existing SIP, RTP, video and log directory isolation is still required.
+A token is a Web control capability, NOT a SIP password or an administrator password.
+
+3. Explicit remote mode — only if later approved
+Do not change A/B/C deployment or firewall for this task.
+To opt in, provide all of the following in a private config:
+  web.remote.enabled=true
+  web.bind.address=<one concrete LAN IPv4>
+  web.allowed.hosts=<optional exact DNS names, comma-separated, no scheme/port>
+  web.tls.keystore=<absolute private PKCS12 or JKS path>
+  web.tls.password.file=<absolute private UTF-8 single-line password file>
+  web.tls.keystore.type=PKCS12
+The bind address is automatically an allowed Host; wildcard binding is rejected.
+Remote mode without TLS, partial TLS settings, invalid TLS or overly broad private-file
+permissions fail before a listener is bound. TLS is explicitly limited to 1.2 for Java 8.
+Provision a certificate whose SAN matches the address/name and trust it on the intended browser.
+Certificate creation/trust installation is a separate operator action; none was done here.
+The keystore (<=1MiB), password (<=4096B) and token (<=128B) must belong to the current OS
+user and grant access only to that user. Protect these files in an owner-controlled directory.
+Do not use curl -k, browser warning bypasses or plaintext remote credentials as acceptance.
+
+4. Build/reproduce local automated verification
+No real SIP server, device, VideoRelay or production Web instance is needed for these tests.
+All integration listeners use 127.0.0.1:0; fake SIP/MSS methods never initialize networking.
+
+PowerShell (session-scoped environment only):
+  Set-Location D:\Projects\sip-im-web-security
+  $env:JAVA_HOME='C:\Users\21702\.jdks\corretto-1.8.0_504'
+  $env:PATH=$env:JAVA_HOME+'\bin;'+$env:PATH
+  $env:MAVEN_OPTS='-Dfile.encoding=UTF-8'
+  & 'D:\IntelliJ IDEA 2026.2.3\plugins\maven-plugin\lib\maven3\bin\mvn.cmd' package
+  & 'C:\Program Files\nodejs\node.exe' --check src/main/resources/web-access.js
+  & 'C:\Program Files\nodejs\node.exe' src/test/js/web-access.test.js
+  git diff --check
+
+For the actual offline run, Maven uses only this worktree's copied dependency cache:
+  -o -gs target\web-security-settings.xml -s target\web-security-settings.xml
+  -Dmaven.repo.local=<absolute worktree>\target\web-security-maven-repository
+The original dependency cache and other worktrees are read-only.
+No tests are skipped. Temporary test keys/passwords/tokens are synthetic, not SIP credentials.
+Surefire reports: target\surefire-reports
+Captured output: target\web-security-evidence
+Node tests are separate; Maven does not automatically execute them.
+
+5. Manual acceptance — all NOT_RUN until an operator actually performs it
+Do not run the commands below until SIP-client startup/testing is authorized.
+Build and copy dependencies without running a client:
+  & '<existing Maven>\bin\mvn.cmd' package dependency:copy-dependencies -DincludeScope=runtime -DoutputDirectory=target\lib
+
+In an isolated run directory with an operator-supplied PRIVATE config:
+  & '<JDK8>\bin\java.exe' '-Dfile.encoding=UTF-8' '-Dsip.config=<absolute private config>' -cp '<worktree>\target\sipvideo-1.0-SNAPSHOT.jar;<worktree>\target\lib\*' org.example.WebClientServer
+This command WILL start SIP registration/media behavior according to that private config.
+Set call.auto.invite=false before a controlled test; keep the original file unchanged.
+Stop using Ctrl+C in that specific console. Never taskkill all Java processes.
+
+Acceptance sequence:
+[NOT_RUN] Unauthenticated page shows login; GET /api/state, /api/stream and /files/name return401.
+[NOT_RUN] Wrong token fails; correct private token shows contacts and registration state.
+[NOT_RUN] Refresh restores session and SSE without requiring a token in the URL.
+[NOT_RUN] Single-chat text/Chinese, image, WAV voice, video file still send/receive.
+[NOT_RUN] Authenticated attachment image/audio/video URLs display via the same-origin cookie.
+[NOT_RUN] Voice/video call, room *6*1, hangup, start/stop recording still work normally.
+[NOT_RUN] A foreign origin's form/fetch cannot trigger send, call, hangup or recording.
+[NOT_RUN] Authenticated controls lacking X-SIP-CSRF are rejected403; GET controls405.
+[NOT_RUN] Unexpected Host, forged Origin/null, cross-site/same-site requests denied;
+          spoofed Origin alone with no cookie does not gain access.
+[NOT_RUN] Logout denies further APIs/files and disconnects SSE; no subsequent private event arrives.
+[NOT_RUN] Expiry, backend disconnect, SSE reconnect and 5th concurrent stream behave as documented.
+[NOT_RUN] >16KiB text and >16MiB upload receive413 without invoking the SIP sender.
+[NOT_RUN] Three local Web ports keep separate sessions/cookies/configurations.
+[NOT_RUN] In an approved remote HTTPS setup, certificate validation and Secure cookie succeed;
+          plaintext remote startup fails and an unauthorized second host remains denied.
+
+For each case record PASS/FAIL/BLOCKED/NOT_RUN, Git SHA, environment, response status,
+fake/real distinction and timestamps. Never collect token/session/CSRF/cookie/keystore secrets.
+Real cross-computer SIP/media quality is NOT proven by loopback/DOM tests.
+
+6. Rollback
+This is an independent branch; original branches/packages remain unchanged.
+Stop only this test process, then use the original package and original private configuration.
+No server, account, firewall or database rollback is needed. Keep the private token outside
+public source/evidence archives; deliberate token rotation requires stopping the instance,
+privately archiving/replacing that file and restarting (not performed automatically).
+
+7. Integration with other independent changes
+- Group PR: resolve WebClientServer root dispatcher and chat.html lifecycle conflicts.
+  Add GroupWebApi dispatch INSIDE registerRoutes' protected delegate, never a new unwrapped
+  HttpServer context. Guard already has exact /api/groups and create/join/send/leave/sync/retry
+  policies. Pass WebAccess.fetch to group-chat.js explicitly; do not replace global fetch.
+  Start group polling/SSE only after login, stop on logout, merge group DOM tests.
+- File-security PR: replace legacy handleFile/handleFiles with FileHttpApi INSIDE the same
+  protected dispatcher; retain ReceivedFileStore paths, unique names, ranges and safe metadata.
+  Preserve this guard's 16MiB upload boundary and authenticated download/HEAD requirements.
+  Keep that PR's safe attachmentEvent, do not restore legacy raw filenames.
+- POM test additions are intentionally aligned with audio/group/file: JUnit4.13.2,
+  Surefire3.5.4, failIfNoTests and target workingDirectory. Deduplicate on merge.
+- Audio/video code is not changed by this branch; merge and rerun the combined tests plus
+  real A/B/C regression before declaring a unified final release.
+
+8. Remaining limits
+This is a single-owner PC-client control capability, not a multi-user/roles identity system.
+Same-host malicious programs, OS administrators, compromised browser extensions or same-origin
+XSS are outside this boundary. Cookies are NOT isolated from every service on the same hostname;
+port-qualified names prevent accidental multi-instance collisions, not malicious local services.
+Legacy inline JS/style requires CSP unsafe-inline; nonce migration is a later change.
+Java8 path checks still depend on a trusted parent directory; they are not an OS-level sandbox.
+Login/logout does not automatically hang up a live call. If authentication expires mid-recording,
+the UI cannot issue a new privileged stop; an operator must reconnect/stop the existing process.
+SSE resources are released on error/heartbeat (<=15 seconds for quiet disconnected streams).
+A slow authenticated reader can still slow broadcast; this change is not a streaming-system rewrite.
+Bounded payloads do not provide comprehensive slow-client/DoS protection or a public Internet gateway.
+The legacy file storage/path issues remain for the separate file-security change.
+AdminServer is a different process and is not protected by this Web-client guard.
+MssClient's existing upstream miniSIPServer authorization uses a password query parameter;
+that legacy upstream contract and its configuration were not changed here. New Web credentials
+never use query parameters. Existing public example SIP/admin passwords remain template values,
+not a recommendation for real deployments.
+
+9. Actual local verification (2026-10-20)
+Corretto 1.8.0_504-b04, Maven 3.9.16, Java class major version 52.
+Maven package: PASS; 110 tests, 0 failures, 0 errors, 0 skipped.
+  PrivateWebTokenTest 19; WebAccessControlTest 50;
+  WebSecurityIntegrationTest 18; WebServerSettingsTest 18; WebTlsIntegrationTest 5.
+Node browser DOM/auth tests: 28 PASS, 0 FAIL; JavaScript syntax: PASS.
+Runtime dependencies: 8 JARs copied using cached dependency-plugin 3.6.1.
+The unversioned dependency: prefix selected unavailable 3.7.0 in offline mode;
+that optional invocation failed before tests and was replaced by the explicit cached version.
+Use org.apache.maven.plugins:maven-dependency-plugin:3.6.1:copy-dependencies for this offline cache.
+Earlier iterations exposed Windows Java8 null fileKey and a SID/account-name test fixture;
+both were corrected and the COMPLETE Java suite rerun successfully without skipping tests.
+JAR: target\sipvideo-1.0-SNAPSHOT.jar
+JAR SHA-256: B933AE7728C62680C4AE3625A021DFE3E854A36A4412F6D105AF8DF45DA55C3C
+Real browser/SIP/server/media/A-B-C manual validation: NOT_RUN.
+
+Operational notes: page polling renews idle sessions; the 8-hour absolute expiry still applies.
+Open the client directly from the browser address bar; same-site navigation from a different
+local port is intentionally rejected by Fetch Metadata checks.
+Windows Java8 identity checks use transient same-directory hard links when fileKey is absent;
+the private parent directory must permit creation/deletion and the file system must support it.
