@@ -52,12 +52,26 @@ public class WebClientServer {
     /** 已连接的浏览器 SSE 通道 */
     private static final Set<SseClient> CLIENTS = ConcurrentHashMap.newKeySet();
 
-    private static SipVideoCallClient sip;
+    private static volatile SipVideoCallClient sip;
+    private static final GroupService GROUPS = new GroupService(MY_USER, (recipient, body, completion) -> {
+        SipVideoCallClient current = sip;
+        if (current == null || !current.isRegistered()) throw new IllegalStateException("SIP_NOT_REGISTERED");
+        current.sendGroupEnvelope(recipient, body, completion);
+    });
+    private static final java.util.concurrent.ExecutorService GROUP_EVENTS = Executors.newSingleThreadExecutor(task -> {
+        Thread thread = new Thread(task, "GroupUiEvents"); thread.setDaemon(true); return thread;
+    });
 
     public static void main(String[] args) throws Exception {
         // 1) 先起 Web 服务，页面能立刻打开（此时可能还没注册上）
         HttpServer server = HttpServer.create(new InetSocketAddress(WEB_PORT), 0);
         server.createContext("/", WebClientServer::handleRoot);
+        server.createContext("/group-chat.js", ex -> {
+            try { serveResource(ex, "group-chat.js", "application/javascript; charset=utf-8"); }
+            catch (Exception failure) { sendText(ex, 500, "群界面资源不可用"); }
+        });
+        server.createContext("/api/groups", new GroupWebApi(GROUPS, () -> sip != null && sip.isRegistered()));
+        GROUPS.setListener(() -> GROUP_EVENTS.execute(() -> broadcast(GroupWebApi.event(GROUPS))));
         server.createContext("/api/stream", WebClientServer::handleStream);
         server.createContext("/api/state", WebClientServer::handleState);
         server.createContext("/api/contacts", WebClientServer::handleContacts);
@@ -85,6 +99,7 @@ public class WebClientServer {
             try {
                 sip = new SipVideoCallClient();
                 sip.setUi(new UiBridge());
+                sip.setGroupMessageHandler(GROUPS::receive);
                 sip.init();
             } catch (Exception e) {
                 System.err.println("SIP 引擎启动失败: " + e.getMessage());
@@ -292,6 +307,7 @@ public class WebClientServer {
             hello.addProperty("me", MY_USER);
             hello.addProperty("peer", sip != null ? sip.getTargetUser() : PEER_USER);
             client.send("data: " + hello + "\n\n");
+            client.send("data: " + GroupWebApi.event(GROUPS) + "\n\n");
             // 保持连接：定期发心跳，直到写失败（浏览器关闭）
             while (true) {
                 Thread.sleep(15000);
