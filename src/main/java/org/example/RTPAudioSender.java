@@ -1,126 +1,154 @@
 package org.example;
 
-import java.net.*;
+import java.io.IOException;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
+import java.net.SocketException;
+import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
+import java.util.concurrent.ThreadLocalRandom;
 
+/** Packetizes 16-bit little-endian, mono, 8 kHz PCM into 20 ms G.711 RTP. */
 public class RTPAudioSender {
-    private DatagramSocket socket;
-    private boolean ownsSocket;
+    static final int PCM_FRAME_BYTES = 320;
+    private static final int SAMPLES_PER_FRAME = 160;
+    private final DatagramSocket socket;
+    private final boolean ownsSocket;
+    private final G711Codec codec;
+    private final int payloadType;
+    private final int ssrc = ThreadLocalRandom.current().nextInt();
+    private final byte[] pendingPcm = new byte[PCM_FRAME_BYTES];
+    private int pendingBytes;
+    private int sequenceNumber;
+    private long timestamp;
     private InetAddress remoteAddress;
     private int remotePort;
-    private int sequenceNumber = 0;
-    private long timestamp = 0;
-    private int ssrc;
-    private long startTime;
-    /** 已成功发出的 RTP 包数（用于判断音频是否真的在发送） */
-    private volatile long packetsSent = 0;
-    /** 麦克风采集音频的平均电平（0~32767），用于判断是否真的采到了声音 */
-    private volatile int micLevel = 0;
+    private boolean closed;
+    private volatile long packetsSent;
+    private volatile long sendFailures;
+    private volatile IOException lastSendFailure;
+    private volatile int micLevel;
 
-    /**
-     * 复用外部已有 socket（一般是 RTPAudioReceiver 的），
-     * 使 RTP 收发共用同一个本地端口，满足对称 RTP 要求。
-     */
+    /** Compatibility default: only PCMU, payload type 0. */
     public RTPAudioSender(DatagramSocket sharedSocket) {
-        this.socket = sharedSocket;
-        this.ownsSocket = false;
-        ssrc = (int) (Math.random() * Integer.MAX_VALUE);
-        startTime = System.currentTimeMillis();
-        System.out.println("RTP发送器已创建，复用本地端口: " + sharedSocket.getLocalPort());
+        this(sharedSocket, G711Codec.PCMU, 0);
+    }
+
+    public RTPAudioSender(DatagramSocket sharedSocket, G711Codec codec, int payloadType) {
+        this(sharedSocket, false, codec, payloadType);
     }
 
     public RTPAudioSender(int localPort) throws SocketException {
-        socket = new DatagramSocket(localPort);
-        ownsSocket = true;
-        ssrc = (int) (Math.random() * Integer.MAX_VALUE);
-        startTime = System.currentTimeMillis();
-        System.out.println("RTP发送器已创建，本地端口: " + localPort);
+        this(new DatagramSocket(localPort), true, G711Codec.PCMU, 0);
     }
 
-    public void setRemote(String ip, int port) throws UnknownHostException {
-        this.remoteAddress = InetAddress.getByName(ip);
-        this.remotePort = port;
-        System.out.println("RTP目标设置为: " + ip + ":" + port);
+    private RTPAudioSender(DatagramSocket socket, boolean ownsSocket,
+                           G711Codec codec, int payloadType) {
+        if (socket == null || socket.isClosed()) {
+            throw new IllegalArgumentException("An open RTP socket is required");
+        }
+        if (codec == null || payloadType < 0 || payloadType > 127 || payloadType == 101) {
+            throw new IllegalArgumentException("A codec and an audio payload type are required");
+        }
+        if ((payloadType == 0 && codec != G711Codec.PCMU)
+                || (payloadType == 8 && codec != G711Codec.PCMA)
+                || (payloadType != 0 && payloadType != 8 && payloadType < 96)) {
+            throw new IllegalArgumentException("The codec does not match the static RTP payload type");
+        }
+        this.socket = socket;
+        this.ownsSocket = ownsSocket;
+        this.codec = codec;
+        this.payloadType = payloadType;
+        System.out.println("RTP sender: local UDP " + socket.getLocalPort()
+                + ", codec=" + codec.getRtpName() + ", PT=" + payloadType);
+    }
+
+    public synchronized void setRemote(String ip, int port) throws UnknownHostException {
+        if (ip == null || ip.trim().isEmpty() || port < 1 || port > 65535) {
+            throw new IllegalArgumentException("A destination address and valid UDP port are required");
+        }
+        if (closed) throw new IllegalStateException("RTP sender is closed");
+        remoteAddress = InetAddress.getByName(ip);
+        remotePort = port;
+        System.out.println("RTP target: " + remoteAddress.getHostAddress() + ":" + port);
     }
 
     public void sendAudio(byte[] pcmData, int length) {
-        if (remoteAddress == null) return;
+        sendAudio(pcmData, 0, length);
+    }
 
-        // 统计麦克风电平（16bit little-endian 有符号 PCM 的绝对平均值）
-        int sum = 0;
-        int n = length / 2;
-        for (int i = 0; i < n; i++) {
-            int s = (short) ((pcmData[2 * i + 1] << 8) | (pcmData[2 * i] & 0xFF));
-            sum += Math.abs(s);
+    /** Short reads accumulate; only complete 20 ms frames become RTP packets. */
+    public synchronized void sendAudio(byte[] pcmData, int offset, int length) {
+        if (pcmData == null || offset < 0 || length < 0
+                || offset > pcmData.length - length || (offset & 1) != 0 || (length & 1) != 0) {
+            throw new IllegalArgumentException("PCM must contain complete 16-bit samples within bounds");
         }
-        int avg = (n > 0) ? (sum / n) : 0;
-        micLevel = (int) (micLevel * 0.85 + avg * 0.15);
-
-        try {
-            // 将 16bit PCM 转换为 8bit PCMU
-            byte[] mulawData = PCMUEncoder.encode(pcmData);
-
-            // 构建RTP包
-            byte[] rtpPacket = buildRTPPacket(mulawData);
-
-            DatagramPacket packet = new DatagramPacket(
-                    rtpPacket, rtpPacket.length, remoteAddress, remotePort
-            );
-
-            socket.send(packet);
-            packetsSent++;
-
-            sequenceNumber++;
-            if (sequenceNumber > 65535) {
-                sequenceNumber = 0;
+        if (closed) throw new IllegalStateException("RTP sender is closed");
+        if (remoteAddress == null) throw new IllegalStateException("RTP destination is not configured");
+        int end = offset + length;
+        while (offset < end) {
+            int count = Math.min(PCM_FRAME_BYTES - pendingBytes, end - offset);
+            System.arraycopy(pcmData, offset, pendingPcm, pendingBytes, count);
+            pendingBytes += count;
+            offset += count;
+            if (pendingBytes == PCM_FRAME_BYTES) {
+                try {
+                    sendFrame();
+                } finally {
+                    pendingBytes = 0;
+                }
             }
-
-            // 时间戳增量 = 样本数 (20ms @ 8kHz = 160 samples)
-            timestamp += 160;
-
-        } catch (Exception e) {
-            System.err.println("RTP发送失败: " + e.getMessage());
         }
     }
 
-    private byte[] buildRTPPacket(byte[] payload) {
-        ByteBuffer buffer = ByteBuffer.allocate(12 + payload.length);
-
-        // Byte 0: V(2)=2, P(1)=0, X(1)=0, CC(4)=0
-        buffer.put((byte) 0x80);
-
-        // Byte 1: M(1)=0, PT(7)=0 (PCMU)
-        buffer.put((byte) 0x00);
-
-        // Bytes 2-3: Sequence Number
-        buffer.putShort((short) sequenceNumber);
-
-        // Bytes 4-7: Timestamp
-        buffer.putInt((int) timestamp);
-
-        // Bytes 8-11: SSRC
-        buffer.putInt(ssrc);
-
-        // Payload
-        buffer.put(payload);
-
-        return buffer.array();
-    }
-
-    /** 已成功发出的 RTP 包数 */
-    public long getPacketsSent() {
-        return packetsSent;
-    }
-
-    /** 麦克风当前平均电平（说话时明显上升，静音时接近 0） */
-    public int getMicLevel() {
-        return micLevel;
-    }
-
-    public void close() {
-        // 共享 socket 由接收器负责关闭；这里若抢先关闭，接收线程会抛异常
-        if (ownsSocket && socket != null && !socket.isClosed()) {
-            socket.close();
+    private void sendFrame() {
+        long sum = 0;
+        for (int i = 0; i < PCM_FRAME_BYTES; i += 2) {
+            int sample = (short) ((pendingPcm[i + 1] << 8) | (pendingPcm[i] & 0xff));
+            sum += Math.abs(sample);
         }
+        micLevel = (int) (micLevel * 0.85 + (sum / SAMPLES_PER_FRAME) * 0.15);
+        byte[] encoded = codec.encode(pendingPcm, 0, pendingPcm.length);
+        byte[] packet = packetize(encoded, payloadType, sequenceNumber, timestamp, ssrc);
+        // Advance the media clock even on UDP failure; never retry stale audio.
+        sequenceNumber = (sequenceNumber + 1) & 0xffff;
+        timestamp = (timestamp + SAMPLES_PER_FRAME) & 0xffffffffL;
+        try {
+            socket.send(new DatagramPacket(packet, packet.length, remoteAddress, remotePort));
+            packetsSent++;
+        } catch (IOException failure) {
+            lastSendFailure = failure;
+            long count = ++sendFailures;
+            if (count <= 3 || count % 100 == 0) {
+                System.err.println("RTP audio send failed (" + count + "): " + failure.getMessage());
+            }
+        }
+    }
+
+    /** Pure packet construction, including sequence/timestamp wrap-around. */
+    static byte[] packetize(byte[] payload, int payloadType, int sequence,
+                            long timestamp, int ssrc) {
+        if (payload == null || payload.length == 0 || payload.length > 65507 - 12
+                || payloadType < 0 || payloadType > 127) {
+            throw new IllegalArgumentException("Invalid RTP audio payload");
+        }
+        ByteBuffer out = ByteBuffer.allocate(12 + payload.length);
+        out.put((byte) 0x80).put((byte) payloadType);
+        out.putShort((short) sequence).putInt((int) timestamp).putInt(ssrc).put(payload);
+        return out.array();
+    }
+
+    public long getPacketsSent() { return packetsSent; }
+    public long getSendFailures() { return sendFailures; }
+    public IOException getLastSendFailure() { return lastSendFailure; }
+    public int getMicLevel() { return micLevel; }
+
+    public synchronized void close() {
+        if (closed) return;
+        closed = true;
+        pendingBytes = 0;
+        // Shared sockets remain the receiver's responsibility.
+        if (ownsSocket) socket.close();
     }
 }
