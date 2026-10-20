@@ -37,7 +37,7 @@ public class SipVideoCallClient implements SipListener {
     private String localIp    = cfg("sip.local.ip",     "10.122.213.68");
     private int    localPort  = intCfg("sip.local.port",  5061);
 
-    private String targetUser = cfg("sip.target.user",  "101");
+    private volatile String targetUser = cfg("sip.target.user",  "101");
 
     /** 通话时长（秒），到时自动挂断 */
     private static final int CALL_DURATION_SEC = intCfg("call.duration.sec", 180);
@@ -52,12 +52,139 @@ public class SipVideoCallClient implements SipListener {
     private static final java.util.concurrent.CountDownLatch SHUTDOWN_LATCH =
             new java.util.concurrent.CountDownLatch(1);
 
-    private Dialog dialog;
-    private ClientTransaction inviteTransaction;
+    /** SIP objects belong to one immutable lifecycle identity, never to the next call. */
+    private final CallLifecycleManager calls;
+    private final LinkedHashMap<String, SipCall> sipCalls = new LinkedHashMap<>();
+    private final LinkedHashMap<String, Boolean> orphanEndedDialogs = new LinkedHashMap<>();
+    private volatile CallSession mediaSession;
+    private CallSession cleanupSession;
+    private volatile boolean shuttingDown;
+    private volatile Thread reRegisterThread;
+    private Thread videoLoopThread;
+    private Thread levelMonitorThread;
+
+    public SipVideoCallClient() { this(new CallLifecycleManager()); }
+
+    SipVideoCallClient(CallLifecycleManager calls) {
+        this.calls = Objects.requireNonNull(calls, "calls");
+    }
+
+    private static final class SipCall {
+        final CallSession session;
+        final String localTag;
+        final String remoteTag;
+        final Set<Long> inviteSequences = new HashSet<>();
+        final Set<String> terminatedDialogs = new HashSet<>();
+        ClientTransaction inviteTx;
+        ServerTransaction incomingTx;
+        Request incomingRequest;
+        Response finalResponse;
+        Dialog dialog;
+        String acceptedRemoteTag;
+        String remoteSdp;
+        boolean provisional;
+        boolean cancelWanted;
+        boolean cancelSent;
+        boolean finalSent;
+        boolean answerSent;
+        boolean incomingAckReceived;
+        boolean endedNotified;
+        int authenticationAttempts;
+
+        SipCall(CallSession session, String localTag, String remoteTag) {
+            this.session = session;
+            this.localTag = localTag;
+            this.remoteTag = remoteTag;
+            inviteSequences.add(session.getInviteCSeq());
+        }
+    }
+
+    private void remember(SipCall call) {
+        sipCalls.put(call.session.getCallId(), call);
+        while (sipCalls.size() > 64) {
+            Iterator<Map.Entry<String, SipCall>> it = sipCalls.entrySet().iterator();
+            while (it.hasNext()) {
+                SipCall old = it.next().getValue();
+                if (old != call && !calls.isActive(old.session)) { it.remove(); break; }
+            }
+        }
+    }
+
+    private static String callLabel(CallSession session) {
+        if (session == null) return "[call no-media-owner] ";
+        return "[call " + session.getId().substring(0, 8)
+                + " Call-ID=" + logValue(session.getCallId())
+                + " seq=" + session.getInviteCSeq()
+                + " state=" + session.getState()
+                + " peer=" + logValue(session.getPeer()) + "] ";
+    }
+
+    private static String logValue(String value) {
+        if (value == null) return "-";
+        String safe = value.replace('\r', '_').replace('\n', '_');
+        return safe.length() > 200 ? safe.substring(0, 200) : safe;
+    }
+
+    private static void logCall(SipCall call, String event) {
+        System.out.println(callLabel(call.session) + event);
+    }
+
+    private static String callId(Message message) {
+        CallIdHeader h = (CallIdHeader) message.getHeader(CallIdHeader.NAME);
+        return h == null ? null : h.getCallId();
+    }
+
+    private static String fromTag(Message message) {
+        FromHeader h = (FromHeader) message.getHeader(FromHeader.NAME);
+        return h == null ? null : h.getTag();
+    }
+
+    private static String toTag(Message message) {
+        ToHeader h = (ToHeader) message.getHeader(ToHeader.NAME);
+        return h == null ? null : h.getTag();
+    }
+
+    private static long sequence(Message message) {
+        CSeqHeader h = (CSeqHeader) message.getHeader(CSeqHeader.NAME);
+        return h == null ? -1 : h.getSeqNumber();
+    }
+
+    private static String branch(Request request) {
+        ViaHeader h = (ViaHeader) request.getHeader(ViaHeader.NAME);
+        return h == null ? null : h.getBranch();
+    }
+
+    private static boolean tagEquals(String expected, String actual) {
+        return expected != null && expected.equals(actual);
+    }
+
+    private boolean ownsRequest(SipCall call, Request request) {
+        if (call == null || !Objects.equals(call.session.getCallId(), callId(request))) return false;
+        String remote = call.session.getDirection() == CallSession.Direction.OUTGOING
+                ? call.acceptedRemoteTag : call.remoteTag;
+        return tagEquals(remote, fromTag(request)) && tagEquals(call.localTag, toTag(request));
+    }
+
+    private static boolean sameDialog(Dialog a, Dialog b) {
+        if (a == null || b == null) return false;
+        if (a == b) return true;
+        return a.getCallId() != null && b.getCallId() != null
+                && Objects.equals(a.getCallId().getCallId(), b.getCallId().getCallId())
+                && tagEquals(a.getLocalTag(), b.getLocalTag())
+                && tagEquals(a.getRemoteTag(), b.getRemoteTag());
+    }
+
+    private boolean matchesResponse(SipCall call, Response response) {
+        return call != null && call.session.getDirection() == CallSession.Direction.OUTGOING
+                && Objects.equals(call.session.getCallId(), callId(response))
+                && tagEquals(call.localTag, fromTag(response))
+                && call.inviteSequences.contains(sequence(response));
+    }
     private boolean isRegistered = false;
 
     /** 当前通话的开始时间 / 对端 / 方向，用于通话结束时统计时长（0 表示当前无通话） */
     private volatile long callStartMillis = 0;
+    private CallSession loggedSession;
     private volatile String callPeer = "";
     private volatile String callDirection = "";
 
@@ -300,16 +427,23 @@ public class SipVideoCallClient implements SipListener {
         System.exit(0);
     }
 
-    /** 停止媒体流并关闭 SIP 协议栈，释放本地端口 */
+    /** Release this client's session, tasks and SIP stack without affecting another instance. */
     public void shutdown() {
-        try {
-            stopMedia();
-            if (sipStack != null) {
-                sipStack.stop();
+        synchronized (calls) {
+            if (shuttingDown) return;
+            shuttingDown = true;
+            CallSession active = calls.active();
+            if (active != null) {
+                SipCall call = sipCalls.get(active.getCallId());
+                try { endLocal(call, "shutdown"); }
+                catch (Exception e) { finishCall(call, "shutdown"); }
             }
-        } catch (Exception e) {
-            e.printStackTrace();
+            if (mediaSession != null) stopMedia();
+            calls.close();
         }
+        Thread registerThread = reRegisterThread;
+        if (registerThread != null) registerThread.interrupt();
+        if (sipStack != null) sipStack.stop();
     }
 
     public void init() throws Exception {
@@ -358,11 +492,11 @@ public class SipVideoCallClient implements SipListener {
             return;
         }
         Thread t = new Thread(() -> {
-            while (!Thread.currentThread().isInterrupted()) {
+            while (!shuttingDown && !Thread.currentThread().isInterrupted()) {
                 try {
                     Thread.sleep(interval * 1000L);
                     System.out.println("\n[定时重新注册] 距上次注册 " + interval + " 秒，重新发送 REGISTER...");
-                    register();
+                    if (!shuttingDown) register();
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 } catch (Exception e) {
@@ -371,6 +505,7 @@ public class SipVideoCallClient implements SipListener {
             }
         }, "ReRegister");
         t.setDaemon(true);
+        reRegisterThread = t;
         t.start();
         System.out.println("定时重新注册: 每 " + interval + " 秒一次");
     }
@@ -485,216 +620,154 @@ public class SipVideoCallClient implements SipListener {
      * @param video true = 视频通话（SDP 带 m=video）；false = 纯语音通话
      */
     public void makeCall(boolean video) throws Exception {
-        // 拨 *6*N 视为进入会议室 N：音频走服务器会议室混音，视频走应用层中继
-        Matcher roomMatcher = Pattern.compile("^\\*6\\*(\\d+)$").matcher(targetUser);
-        this.conferenceRoom = roomMatcher.matches() ? roomMatcher.group(1) : null;
-        this.videoCall = video && VIDEO_ENABLED;
-        String fromSipAddress = "sip:" + username + "@" + serverIp;
-        Address fromAddress = addressFactory.createAddress(fromSipAddress);
-        FromHeader fromHeader = headerFactory.createFromHeader(fromAddress, String.valueOf(System.currentTimeMillis()));
-
-        String toSipAddress = "sip:" + targetUser + "@" + serverIp;
-        Address toAddress = addressFactory.createAddress(toSipAddress);
-        ToHeader toHeader = headerFactory.createToHeader(toAddress, null);
-
-        ViaHeader viaHeader = headerFactory.createViaHeader(localIp, localPort, "udp", null);
-        List<ViaHeader> viaHeaders = new ArrayList<>();
-        viaHeaders.add(viaHeader);
-
-        CallIdHeader callIdHeader = sipProvider.getNewCallId();
-        CSeqHeader cSeqHeader = headerFactory.createCSeqHeader(1L, Request.INVITE);
-        MaxForwardsHeader maxForwards = headerFactory.createMaxForwardsHeader(70);
-
-        SipURI requestURI = addressFactory.createSipURI(targetUser, serverIp);
-        requestURI.setPort(serverPort);
-
-        Request request = messageFactory.createRequest(requestURI, Request.INVITE,
-                callIdHeader, cSeqHeader, fromHeader, toHeader, viaHeaders, maxForwards);
-
-        SipURI contactURI = addressFactory.createSipURI(username, localIp);
-        contactURI.setPort(localPort);
-        Address contactAddress = addressFactory.createAddress(contactURI);
-        ContactHeader contactHeader = headerFactory.createContactHeader(contactAddress);
-        request.addHeader(contactHeader);
-
-        ContentTypeHeader contentTypeHeader = headerFactory.createContentTypeHeader("application", "sdp");
-
-        String sdpData = buildLocalSdp();
-
-        System.out.println("\n发出的SDP:\n" + sdpData);
-        byte[] contents = sdpData.getBytes();
-        request.setContent(contents, contentTypeHeader);
-
-        inviteTransaction = sipProvider.getNewClientTransaction(request);
-        inviteTransaction.sendRequest();
-
-        System.out.println("INVITE请求已发送到: " + targetUser);
-        markCallStart("OUT", targetUser);
-        notifyCall("calling", targetUser);
+        synchronized (calls) { beginOutgoingCall(video, targetUser); }
     }
 
-    /**
-     * 呼叫任意号码：普通分机号（如 101），或会议室号码（如 *6*1）。
-     *
-     * <p>拨号后 {@code targetUser} 会切换为该号码，后续消息也随之发给它；
-     * 想恢复点对点聊天，在网页左侧重新点选联系人即可。
-     *
-     * @param video  true = 视频通话；false = 纯语音通话
-     * @param target 被叫号码
-     */
+    /** The selected contact may change later; the SIP session keeps this peer snapshot. */
     public void makeCall(boolean video, String target) throws Exception {
-        if (target != null && !target.trim().isEmpty()) {
-            this.targetUser = target.trim();
+        synchronized (calls) {
+            String peer = target == null || target.trim().isEmpty() ? targetUser : target.trim();
+            beginOutgoingCall(video, peer);
+            targetUser = peer;
         }
-        makeCall(video);
+    }
+
+    private void beginOutgoingCall(boolean video, String peer) throws Exception {
+        if (shuttingDown) throw new IllegalStateException("Client is shutting down");
+        if (calls.active() != null) throw new IllegalStateException("Another call is active");
+        Matcher roomMatcher = Pattern.compile("^\\*6\\*(\\d+)$").matcher(peer);
+        String room = roomMatcher.matches() ? roomMatcher.group(1) : null;
+        boolean withVideo = video && VIDEO_ENABLED;
+        String localTag = UUID.randomUUID().toString();
+        Address from = addressFactory.createAddress("sip:" + username + "@" + serverIp);
+        Address to = addressFactory.createAddress("sip:" + peer + "@" + serverIp);
+        List<ViaHeader> vias = new ArrayList<>();
+        vias.add(headerFactory.createViaHeader(localIp, localPort, "udp", null));
+        CallIdHeader id = sipProvider.getNewCallId();
+        SipURI uri = addressFactory.createSipURI(peer, serverIp);
+        uri.setPort(serverPort);
+        Request request = messageFactory.createRequest(uri, Request.INVITE, id,
+                headerFactory.createCSeqHeader(1L, Request.INVITE),
+                headerFactory.createFromHeader(from, localTag),
+                headerFactory.createToHeader(to, null), vias, headerFactory.createMaxForwardsHeader(70));
+        request.addHeader(localContact());
+        request.setContent(buildLocalSdp(withVideo).getBytes(StandardCharsets.UTF_8),
+                headerFactory.createContentTypeHeader("application", "sdp"));
+        ClientTransaction transaction = sipProvider.getNewClientTransaction(request);
+        CallSession session = calls.beginOutgoing(id.getCallId(), 1L, transaction.getBranchId(), peer, withVideo, room);
+        SipCall call = new SipCall(session, localTag, null);
+        remember(call);
+        logCall(call, "outgoing INVITE created");
+        try {
+            call.inviteTx = transaction;
+            notifyCall("calling", session.getPeer());
+            armInviteDeadline(call);
+            call.inviteTx.sendRequest();
+        } catch (Exception e) {
+            finishCall(call, "invite-send-failed");
+            throw e;
+        }
+    }
+
+    private ContactHeader localContact() throws Exception {
+        SipURI uri = addressFactory.createSipURI(username, localIp);
+        uri.setPort(localPort);
+        return headerFactory.createContactHeader(addressFactory.createAddress(uri));
+    }
+
+    private void armInviteDeadline(SipCall call) {
+        calls.armTimer(call.session, CallLifecycleManager.TimerKind.INVITE_DEADLINE,
+                Math.max(1, intCfg("call.invite.timeout.sec", 64)) * 1000L,
+                () -> {
+                    synchronized (calls) {
+                        if (!calls.isActive(call.session)) return;
+                        try { endLocal(call, "invite-timeout"); }
+                        catch (Exception e) { finishCall(call, "invite-timeout"); }
+                    }
+                });
     }
 
     /** 记录通话开始（供后台统计） */
-    private void markCallStart(String direction, String peer) {
+    private void markCallStart(CallSession session) {
+        loggedSession = session;
+        String direction = session.getDirection() == CallSession.Direction.OUTGOING ? "OUT" : "IN";
+        String peer = session.getPeer();
         callStartMillis = System.currentTimeMillis();
         callPeer = peer;
         callDirection = direction;
         EventLog.log("CALL_START", direction, peer, "");
     }
 
-    // 带认证的INVITE
-    private void inviteWithAuth(Response challengeResponse, ClientTransaction originalTransaction) throws Exception {
-        System.out.println("发送带认证信息的INVITE");
-
-        ProxyAuthenticateHeader proxyAuthHeader = (ProxyAuthenticateHeader) challengeResponse.getHeader(ProxyAuthenticateHeader.NAME);
-        WWWAuthenticateHeader wwwAuthHeader = (WWWAuthenticateHeader) challengeResponse.getHeader(WWWAuthenticateHeader.NAME);
-
-        String realm, nonce, algorithm;
-        boolean isProxy = false;
-
-        if (proxyAuthHeader != null) {
-            realm = proxyAuthHeader.getRealm();
-            nonce = proxyAuthHeader.getNonce();
-            algorithm = proxyAuthHeader.getAlgorithm();
-            isProxy = true;
-        } else if (wwwAuthHeader != null) {
-            realm = wwwAuthHeader.getRealm();
-            nonce = wwwAuthHeader.getNonce();
-            algorithm = wwwAuthHeader.getAlgorithm();
-        } else {
-            System.out.println("无法获取认证头");
-            return;
+    // Preserve Call-ID, From tag, URI and SDP when retrying the same INVITE with credentials.
+    private void inviteWithAuth(Response challengeResponse, SipCall call) throws Exception {
+        if (call.authenticationAttempts >= 2 || call.inviteTx == null) {
+            throw new IllegalStateException("INVITE authentication retry limit reached");
         }
-
+        ProxyAuthenticateHeader proxy = (ProxyAuthenticateHeader) challengeResponse.getHeader(ProxyAuthenticateHeader.NAME);
+        WWWAuthenticateHeader www = (WWWAuthenticateHeader) challengeResponse.getHeader(WWWAuthenticateHeader.NAME);
+        if (proxy == null && www == null) throw new IllegalArgumentException("Missing authentication challenge");
+        String realm = proxy != null ? proxy.getRealm() : www.getRealm();
+        String nonce = proxy != null ? proxy.getNonce() : www.getNonce();
+        String algorithm = proxy != null ? proxy.getAlgorithm() : www.getAlgorithm();
         if (algorithm == null) algorithm = "MD5";
-
-        sendAuthenticatedInvite(realm, nonce, algorithm, isProxy);
+        Request request = (Request) call.inviteTx.getRequest().clone();
+        request.removeHeader(AuthorizationHeader.NAME);
+        request.removeHeader(ProxyAuthorizationHeader.NAME);
+        long next = sequence(request) + 1L;
+        ((CSeqHeader) request.getHeader(CSeqHeader.NAME)).setSeqNumber(next);
+        ((ViaHeader) request.getHeader(ViaHeader.NAME)).removeParameter("branch");
+        String uri = request.getRequestURI().toString();
+        String digest = calculateDigestResponse(username, realm, password, nonce, Request.INVITE, uri, algorithm);
+        if (digest == null) throw new IllegalArgumentException("Unsupported authentication algorithm");
+        AuthorizationHeader auth = proxy != null
+                ? headerFactory.createProxyAuthorizationHeader("Digest")
+                : headerFactory.createAuthorizationHeader("Digest");
+        auth.setUsername(username);
+        auth.setRealm(realm);
+        auth.setNonce(nonce);
+        auth.setURI(request.getRequestURI());
+        auth.setResponse(digest);
+        auth.setAlgorithm(algorithm);
+        request.addHeader(auth);
+        ClientTransaction replacement = sipProvider.getNewClientTransaction(request);
+        call.authenticationAttempts++;
+        call.inviteSequences.add(next);
+        call.inviteTx = replacement;
+        call.provisional = false;
+        calls.bindInvite(call.session, next, replacement.getBranchId());
+        replacement.sendRequest();
+        logCall(call, "authenticated INVITE retry sent");
     }
 
-    private void sendAuthenticatedInvite(String realm, String nonce, String algorithm, boolean isProxy) throws Exception {
-        String fromSipAddress = "sip:" + username + "@" + serverIp;
-        Address fromAddress = addressFactory.createAddress(fromSipAddress);
-        FromHeader fromHeader = headerFactory.createFromHeader(fromAddress, String.valueOf(System.currentTimeMillis()));
-
-        String toSipAddress = "sip:" + targetUser + "@" + serverIp;
-        Address toAddress = addressFactory.createAddress(toSipAddress);
-        ToHeader toHeader = headerFactory.createToHeader(toAddress, null);
-
-        ViaHeader viaHeader = headerFactory.createViaHeader(localIp, localPort, "udp", null);
-        List<ViaHeader> viaHeaders = new ArrayList<>();
-        viaHeaders.add(viaHeader);
-
-        CallIdHeader callIdHeader = sipProvider.getNewCallId();
-        CSeqHeader cSeqHeader = headerFactory.createCSeqHeader(2L, Request.INVITE);
-        MaxForwardsHeader maxForwards = headerFactory.createMaxForwardsHeader(70);
-
-        SipURI requestURI = addressFactory.createSipURI(targetUser, serverIp);
-        requestURI.setPort(serverPort);
-
-        Request request = messageFactory.createRequest(requestURI, Request.INVITE,
-                callIdHeader, cSeqHeader, fromHeader, toHeader, viaHeaders, maxForwards);
-
-        SipURI contactURI = addressFactory.createSipURI(username, localIp);
-        contactURI.setPort(localPort);
-        Address contactAddress = addressFactory.createAddress(contactURI);
-        ContactHeader contactHeader = headerFactory.createContactHeader(contactAddress);
-        request.addHeader(contactHeader);
-
-        String uri = "sip:" + targetUser + "@" + serverIp + ":" + serverPort;
-        String response = calculateDigestResponse(username, realm, password, nonce, "INVITE", uri, algorithm);
-
-        if (isProxy) {
-            ProxyAuthorizationHeader authHeader = headerFactory.createProxyAuthorizationHeader("Digest");
-            authHeader.setUsername(username);
-            authHeader.setRealm(realm);
-            authHeader.setNonce(nonce);
-            authHeader.setURI(addressFactory.createURI(uri));
-            authHeader.setResponse(response);
-            authHeader.setAlgorithm(algorithm);
-            request.addHeader(authHeader);
-        } else {
-            AuthorizationHeader authHeader = headerFactory.createAuthorizationHeader("Digest");
-            authHeader.setUsername(username);
-            authHeader.setRealm(realm);
-            authHeader.setNonce(nonce);
-            authHeader.setURI(addressFactory.createURI(uri));
-            authHeader.setResponse(response);
-            authHeader.setAlgorithm(algorithm);
-            request.addHeader(authHeader);
-        }
-
-        ContentTypeHeader contentTypeHeader = headerFactory.createContentTypeHeader("application", "sdp");
-        String sdpData = buildLocalSdp();
-
-        System.out.println("\n发出的SDP:\n" + sdpData);
-        byte[] contents = sdpData.getBytes();
-        request.setContent(contents, contentTypeHeader);
-
-        inviteTransaction = sipProvider.getNewClientTransaction(request);
-        inviteTransaction.sendRequest();
-
-        System.out.println("带认证的INVITE已发送");
-    }
-
-    // 启动媒体流
-    private void startMedia(String remoteSdp) {
-        if (rtpReceiver != null) {
-            // 已经在通话中：拨会议室时服务器还会回呼本机并再带一份 SDP，
-            // 若重复建流会二次绑定同一端口（BindException）。此处直接忽略。
-            System.out.println("媒体流已在运行，忽略重复的启动请求");
-            return;
-        }
+    // One media owner is reserved by the lifecycle manager before calling this method.
+    // Package visibility allows device-free SIP adapter tests, without a production test mode.
+    void startMedia(String remoteSdp) {
+        if (rtpReceiver != null) throw new IllegalStateException("Media is already allocated");
+        final CallSession owner = mediaSession;
         try {
-            // 解析对方的SDP，获取IP和端口
             parseRemoteSDP(remoteSdp);
-            System.out.println("\n=== 启动音频流 ===");
-            System.out.println("本地音频端口: " + localAudioPort);
-            System.out.println("远程音频地址: " + remoteAudioIp + ":" + remoteAudioPort);
-
-            // 启动RTP接收器（绑定 localAudioPort，该端口已在上述 SDP 中宣告）
+            if (remoteAudioIp == null || remoteAudioPort < 1 || remoteAudioPort > 65535)
+                throw new IllegalArgumentException("Invalid remote audio endpoint");
             rtpReceiver = new RTPAudioReceiver(localAudioPort);
             rtpReceiver.start();
-
-            // 启动RTP发送器：复用接收器的同一个 socket，保证「收发同端口」。
-            // 若用独立端口发送，对端做对称 RTP 校验时会丢弃数据包，导致单向/无音频。
             rtpSender = new RTPAudioSender(rtpReceiver.getSocket());
             rtpSender.setRemote(remoteAudioIp, remoteAudioPort);
-
-            // 启动音频采集
+            final RTPAudioSender sender = rtpSender;
             audioCapture = new AudioCapture();
             audioCapture.start((data, length) -> {
-                // 将采集的音频通过RTP发送
-                rtpSender.sendAudio(data, length);
+                if (mediaSession == owner) sender.sendAudio(data, length);
             });
-
-            System.out.println("✓ 音频流已启动，可以开始通话！");
             startLevelMonitor();
             if (conferenceRoom != null) startConferenceVideo();
             else startVideo();
-
-        } catch (Exception e) {
-            System.err.println("启动媒体流失败: " + e.getMessage());
-            e.printStackTrace();
+        } catch (Exception failure) {
+            // activateMedia unwinds the whole partially-created owner, then sends BYE.
+            throw new IllegalStateException("Could not start call media", failure);
         }
     }
 
     /** 构造本机 SDP（音频 + 可选视频），主叫和被叫共用 */
-    private String buildLocalSdp() {
+    private String buildLocalSdp(boolean withVideo) {
         return "v=0\r\n" +
                 "o=" + username + " 123456 654321 IN IP4 " + localIp + "\r\n" +
                 "s=Audio/Video Call\r\n" +
@@ -704,7 +777,7 @@ public class SipVideoCallClient implements SipListener {
                 "a=rtpmap:0 PCMU/8000\r\n" +
                 "a=rtpmap:8 PCMA/8000\r\n" +
                 "a=rtpmap:101 telephone-event/8000\r\n" +
-                (videoCall ? videoSdpLine() : "");
+                (withVideo ? videoSdpLine() : "");
     }
 
     /** 生成 SDP 的视频行（未启用视频时返回空串） */
@@ -715,124 +788,115 @@ public class SipVideoCallClient implements SipListener {
     }
 
     /** 启动视频通道：采集 -> JPEG -> RTP 发送；同时接收对端画面并显示 */
-    private void startVideo() {
-        if (!VIDEO_ENABLED) return;
-        if (!videoCall) {
-            System.out.println("本次为语音通话，不启用视频");
-            return;
-        }
-        if (remoteVideoPort <= 0) {
-            System.out.println("对端 SDP 未提供 m=video，本次通话不带视频");
-            return;
-        }
+    private void startVideo() throws Exception {
+        if (!VIDEO_ENABLED || !videoCall || remoteVideoPort <= 0) return;
+        final CallSession owner = mediaSession;
         try {
-            System.out.println("\n=== 启动视频流 ===");
-            System.out.println("本地视频端口: " + videoLocalPort);
-            System.out.println("远程视频地址: " + remoteVideoIp + ":" + remoteVideoPort);
-
             videoSocket = new DatagramSocket(videoLocalPort);
-
-            videoReceiver = new RtpVideoReceiver(videoSocket, jpeg -> {
-                notifyVideo(jpeg, false);
-                if (videoWindow != null) {
-                    java.awt.image.BufferedImage img = VideoCodec.decode(jpeg);
-                    if (img != null) videoWindow.updateRemote(img);
-                }
-            });
-            videoReceiver.start();
-
-            videoSender = new RtpVideoSender(videoSocket);
-            videoSender.setRemote(InetAddress.getByName(remoteVideoIp), remoteVideoPort);
-            videoSender.setFps(VIDEO_FPS);
-
-            try {
-                videoCapture = new VideoCapture(VIDEO_WIDTH, VIDEO_HEIGHT);
-                videoCapture.start();
-            } catch (Exception camEx) {
-                // 摄像头打不开（例如被别的程序占用）时，保留"只看不发"的能力，
-                // 而不是把整条视频通道拆掉——对端画面仍然能收能看。
-                System.err.println("摄像头不可用（" + camEx.getMessage() + "），本次仅接收视频");
-                videoCapture = null;
-            }
-
-            // 命令行模式弹出自带窗口；Web 模式画面由网页显示，不弹 Swing 窗口
             if (ui == null) {
                 videoWindow = new VideoWindow(VIDEO_WIDTH, VIDEO_HEIGHT);
                 videoWindow.showWindow();
             }
-
+            final VideoWindow window = videoWindow;
+            videoReceiver = new RtpVideoReceiver(videoSocket, jpeg -> {
+                if (mediaSession != owner) return;
+                notifyVideo(jpeg, false);
+                if (window != null) {
+                    java.awt.image.BufferedImage image = VideoCodec.decode(jpeg);
+                    if (image != null && mediaSession == owner) window.updateRemote(image);
+                }
+            });
+            videoReceiver.start();
+            videoSender = new RtpVideoSender(videoSocket);
+            videoSender.setRemote(InetAddress.getByName(remoteVideoIp), remoteVideoPort);
+            videoSender.setFps(VIDEO_FPS);
+            try {
+                videoCapture = new VideoCapture(VIDEO_WIDTH, VIDEO_HEIGHT);
+                videoCapture.start();
+            } catch (Exception unavailable) {
+                // Preserve the existing receive-only fallback for an unavailable camera.
+                if (videoCapture != null) videoCapture.stop();
+                videoCapture = null;
+                System.err.println("Camera unavailable; retaining receive-only video");
+            }
             videoRunning = true;
             startVideoLoop();
-            System.out.println("✓ 视频流已启动（"
-                    + VIDEO_WIDTH + "x" + VIDEO_HEIGHT + " @" + VIDEO_FPS + "fps）");
-        } catch (Exception e) {
-            System.err.println("启动视频失败: " + e.getMessage());
+        } catch (Exception failure) {
             stopVideo();
+            throw failure;
         }
     }
 
     /** 采集循环：按帧率抓帧 -> 编码 -> 发送，同时刷新本地预览 */
     private void startVideoLoop() {
+        final CallSession owner = mediaSession;
+        final VideoCapture capture = videoCapture;
+        final RtpVideoSender sender = videoSender;
+        final VideoWindow window = videoWindow;
         Thread t = new Thread(() -> {
             long interval = 1000L / Math.max(1, VIDEO_FPS);
-            while (videoRunning) {
-                long t0 = System.currentTimeMillis();
+            while (videoRunning && mediaSession == owner) {
+                long began = System.currentTimeMillis();
                 try {
-                    if (videoCapture != null) {
-                        java.awt.image.BufferedImage img = videoCapture.grab();
-                        if (img != null) {
-                            if (videoWindow != null) videoWindow.updateLocal(img);
-                            byte[] jpeg = VideoCodec.encode(img, VIDEO_QUALITY);
-                            videoSender.sendFrame(jpeg);
+                    if (capture != null) {
+                        java.awt.image.BufferedImage image = capture.grab();
+                        if (image != null && mediaSession == owner) {
+                            if (window != null) window.updateLocal(image);
+                            byte[] jpeg = VideoCodec.encode(image, VIDEO_QUALITY);
+                            if (mediaSession != owner) break;
+                            sender.sendFrame(jpeg);
                             notifyVideo(jpeg, true);
                         }
-                    } else {
-                        Thread.sleep(interval); // 无摄像头：只收不发
                     }
-                } catch (Exception e) {
-                    System.err.println("视频采集/编码失败: " + e.getMessage());
+                } catch (Exception failure) {
+                    if (mediaSession == owner && videoRunning)
+                        System.err.println("Video capture/encoding failed");
                 }
-                long sleep = interval - (System.currentTimeMillis() - t0);
-                if (sleep > 0) {
-                    try { Thread.sleep(sleep); } catch (InterruptedException e) { break; }
+                long delay = interval - (System.currentTimeMillis() - began);
+                if (delay > 0) {
+                    try { Thread.sleep(delay); }
+                    catch (InterruptedException e) { break; }
                 }
             }
         }, "VideoLoop");
         t.setDaemon(true);
+        videoLoopThread = t;
         t.start();
     }
 
     /** 停止视频并打印统计 */
     private void stopVideo() {
-        if (!videoRunning && videoCapture == null && videoSocket == null) return;
         videoRunning = false;
-        System.out.println("\n停止视频流...");
-
-        long vs = (videoSender != null) ? videoSender.getFramesSent() : 0;
-        long vr = (videoReceiver != null) ? videoReceiver.getFramesReceived() : 0;
-        long vd = (videoReceiver != null) ? videoReceiver.getDroppedFrames() : 0;
-        long fs = (videoSender != null) ? videoSender.getLastFrameSize() : 0;
-        System.out.println("=== 视频收发统计 ===");
-        System.out.println("  已发送帧: " + vs + "  (末帧 " + fs + " 字节)");
-        System.out.println("  已接收帧: " + vr + "   丢弃: " + vd);
-        if (vr == 0) System.out.println("  !! 未收到视频帧 —— 对端到你方向不通");
-        else if (vs == 0) System.out.println("  !! 未发送视频帧 —— 摄像头可能没出图");
-        else System.out.println("  OK 双向都有视频帧");
-
-        if (videoCapture != null) { videoCapture.stop(); videoCapture = null; }
-        if (videoReceiver != null) { videoReceiver.stop(); videoReceiver = null; }
-        if (videoSocket != null) { videoSocket.close(); videoSocket = null; }
+        interruptAndJoin(videoLoopThread);
+        videoLoopThread = null;
+        VideoCapture capture = videoCapture;
+        RtpVideoReceiver receiver = videoReceiver;
+        DatagramSocket socket = videoSocket;
+        VideoWindow window = videoWindow;
+        videoCapture = null;
+        videoReceiver = null;
+        videoSocket = null;
         videoSender = null;
-        if (videoWindow != null) { videoWindow.closeWindow(); videoWindow = null; }
-        System.out.println("视频流已停止");
+        videoWindow = null;
+        if (socket != null) socket.close();
+        if (capture != null) {
+            try { capture.stop(); } catch (RuntimeException e) { System.err.println("Camera cleanup failed"); }
+        }
+        if (receiver != null) {
+            try { receiver.stop(); } catch (RuntimeException e) { System.err.println("Video receiver cleanup failed"); }
+        }
+        if (window != null) {
+            try { window.closeWindow(); } catch (RuntimeException e) { System.err.println("Video window cleanup failed"); }
+        }
     }
 
     /**
      * 启动会议视频：加入与会议室号同名的视频房间。
      * 音频仍走 SIP 会议室（服务器混音），视频走应用层中继，因此支持多人。
      */
-    private void startConferenceVideo() {
-        if (!VIDEO_ENABLED) return;
+    private void startConferenceVideo() throws Exception {
+        if (!VIDEO_ENABLED || !videoCall) return;
+        final CallSession owner = mediaSession;
         final String room = conferenceRoom;
         try {
             confVideo = new ConferenceVideo(VIDEO_RELAY_HOST, VIDEO_RELAY_PORT,
@@ -840,32 +904,34 @@ public class SipVideoCallClient implements SipListener {
                     new ConferenceVideo.Listener() {
                         @Override
                         public void onLocalFrame(byte[] jpeg) {
-                            notifyVideo(jpeg, true);
+                            if (mediaSession == owner) notifyVideo(jpeg, true);
                         }
 
                         @Override
                         public void onRemoteFrame(String from, byte[] jpeg) {
-                            notifyConferenceFrame(from, jpeg);
+                            if (mediaSession == owner) notifyConferenceFrame(from, jpeg);
                         }
 
                         @Override
                         public void onPeerLeft(String from) {
-                            notifyConferencePeerLeft(from);
+                            if (mediaSession == owner) notifyConferencePeerLeft(from);
                         }
                     });
             confVideo.start();
             notifyConferenceState(true, room);
         } catch (Exception e) {
-            System.err.println("启动会议视频失败: " + e.getMessage());
             stopConferenceVideo();
+            throw e;
         }
     }
 
     private void stopConferenceVideo() {
-        if (confVideo != null) {
-            confVideo.stop();
-            confVideo = null;
-            notifyConferenceState(false, conferenceRoom);
+        ConferenceVideo video = confVideo;
+        confVideo = null;
+        if (video != null) {
+            try { video.stop(); }
+            catch (RuntimeException failure) { System.err.println("Conference video cleanup failed"); }
+            finally { notifyConferenceState(false, conferenceRoom); }
         }
     }
 
@@ -876,22 +942,21 @@ public class SipVideoCallClient implements SipListener {
      */
     private void startLevelMonitor() {
         levelMonitorRunning = true;
+        final CallSession owner = mediaSession;
+        final RTPAudioSender sender = rtpSender;
+        final RTPAudioReceiver receiver = rtpReceiver;
         Thread t = new Thread(() -> {
-            System.out.println("\n[音频电平监视] 每 2 秒打印一次：你对手机说话看「上行」，手机说话看「下行」");
-            while (levelMonitorRunning) {
-                try {
-                    Thread.sleep(2000);
-                } catch (InterruptedException e) {
-                    break;
-                }
-                if (!levelMonitorRunning || rtpSender == null || rtpReceiver == null) continue;
-                System.out.println("[音频电平]  上行(你说话)=" + rtpSender.getMicLevel()
-                        + "   下行(对端说话)=" + rtpReceiver.getRecvLevel()
-                        + "   收发包数=" + rtpSender.getPacketsSent() + "/" + rtpReceiver.getPacketsReceived());
+            while (levelMonitorRunning && mediaSession == owner) {
+                try { Thread.sleep(2000); }
+                catch (InterruptedException e) { break; }
+                if (!levelMonitorRunning || mediaSession != owner) break;
+                System.out.println("[RTP] sent=" + sender.getPacketsSent()
+                        + " received=" + receiver.getPacketsReceived()
+                        + " mic=" + sender.getMicLevel() + " remote=" + receiver.getRecvLevel());
             }
-            System.out.println("[音频电平监视] 已停止");
         }, "LevelMonitor");
         t.setDaemon(true);
+        levelMonitorThread = t;
         t.start();
     }
 
@@ -900,6 +965,9 @@ public class SipVideoCallClient implements SipListener {
         System.out.println("\n收到的SDP:");
         System.out.println(sdp);
 
+        remoteAudioIp = null;
+        remoteAudioPort = 0;
+        remoteVideoIp = null;
         // 解析 c= 行获取IP
         Pattern cPattern = Pattern.compile("c=IN IP4 ([\\d.]+)");
         Matcher cMatcher = cPattern.matcher(sdp);
@@ -928,53 +996,52 @@ public class SipVideoCallClient implements SipListener {
                 + ", 视频端口: " + (remoteVideoPort > 0 ? remoteVideoPort : "无"));
     }
 
-    // 停止媒体流
-    private void stopMedia() {
-        // 通话结束：记录时长供后台统计
-        if (callStartMillis > 0) {
-            long durSec = (System.currentTimeMillis() - callStartMillis) / 1000;
-            EventLog.log("CALL_END", callDirection, callPeer, String.valueOf(durSec));
-            notifyCall("ended", callPeer);
-            callStartMillis = 0;
-        }
-        // 关键：清空 dialog，否则下一次通话会沿用上一次的 dialog，
-        // 导致 BYE/ACK 发给上一次的对端（表现为对方收到挂断后画面卡住）
-        dialog = null;
-        inviteTransaction = null;
-        System.out.println("\n停止音频流...");
+    // Only finishCall for the matching owner calls this, under the lifecycle monitor.
+    void stopMedia() {
+        CallSession owner = mediaSession != null ? mediaSession : cleanupSession;
+        mediaSession = null;
+        System.out.println(callLabel(owner) + "RTP cleanup: audioSent="
+                + (rtpSender == null ? 0 : rtpSender.getPacketsSent())
+                + " audioReceived=" + (rtpReceiver == null ? 0 : rtpReceiver.getPacketsReceived())
+                + " videoSent=" + (videoSender == null ? 0 : videoSender.getFramesSent())
+                + " videoReceived=" + (videoReceiver == null ? 0 : videoReceiver.getFramesReceived())
+                + " videoDropped=" + (videoReceiver == null ? 0 : videoReceiver.getDroppedFrames()));
         levelMonitorRunning = false;
+        interruptAndJoin(levelMonitorThread);
+        levelMonitorThread = null;
         stopVideo();
         stopConferenceVideo();
+        AudioCapture capture = audioCapture;
+        RTPAudioSender sender = rtpSender;
+        RTPAudioReceiver receiver = rtpReceiver;
+        audioCapture = null;
+        rtpSender = null;
+        rtpReceiver = null;
+        // Clear ownership first, so callbacks that were already in flight cannot send new audio.
+        mediaSession = null;
+        if (capture != null) {
+            try { capture.stop(); } catch (RuntimeException e) { System.err.println("Audio capture cleanup failed"); }
+        }
+        if (sender != null) {
+            try { sender.close(); } catch (RuntimeException e) { System.err.println("Audio sender cleanup failed"); }
+        }
+        if (receiver != null) {
+            try { receiver.stop(); } catch (RuntimeException e) { System.err.println("Audio receiver cleanup failed"); }
+        }
         conferenceRoom = null;
+        videoCall = false;
+        remoteAudioIp = null;
+        remoteAudioPort = 0;
+        remoteVideoIp = null;
+        remoteVideoPort = 0;
+        System.out.println("Call media released");
+    }
 
-        // 先打印收发统计：用于判断音频是否真的双向流动（不依赖人耳）
-        long sent = (rtpSender != null) ? rtpSender.getPacketsSent() : 0;
-        long recv = (rtpReceiver != null) ? rtpReceiver.getPacketsReceived() : 0;
-        System.out.println("=== RTP 收发统计 ===");
-        System.out.println("  已发送音频包: " + sent);
-        System.out.println("  已接收音频包: " + recv);
-        if (recv == 0) {
-            System.out.println("  !! 未收到任何音频包 —— 对端到你方向不通");
-        } else if (sent == 0) {
-            System.out.println("  !! 未发送任何音频包 —— 麦克风可能没采集到数据");
-        } else {
-            System.out.println("  OK 双向都有音频包，媒体通道正常");
-        }
-
-        if (audioCapture != null) {
-            audioCapture.stop();
-            audioCapture = null;
-        }
-        if (rtpSender != null) {
-            rtpSender.close();
-            rtpSender = null;
-        }
-        if (rtpReceiver != null) {
-            rtpReceiver.stop();
-            rtpReceiver = null;
-        }
-
-        System.out.println("音频流已停止");
+    private static void interruptAndJoin(Thread thread) {
+        if (thread == null || thread == Thread.currentThread()) return;
+        thread.interrupt();
+        try { thread.join(1000L); }
+        catch (InterruptedException e) { Thread.currentThread().interrupt(); }
     }
 
     // 计算Digest认证响应
@@ -1011,21 +1078,143 @@ public class SipVideoCallClient implements SipListener {
         return sb.toString();
     }
 
-    private void sendAck(Response response) throws Exception {
-        CSeqHeader cseq = (CSeqHeader) response.getHeader(CSeqHeader.NAME);
-        Request ackRequest = dialog.createAck(cseq.getSeqNumber());
-        dialog.sendAck(ackRequest);
-        System.out.println("ACK已发送");
+    private void sendAck(Dialog dialog, Response response) throws Exception {
+        Request ack = dialog.createAck(sequence(response));
+        dialog.sendAck(ack);
+    }
+
+    private void sendBye(SipCall call, Dialog dialog) throws Exception {
+        if (dialog == null) return;
+        String key = String.valueOf(dialog.getLocalTag()) + "/" + String.valueOf(dialog.getRemoteTag());
+        if (call.terminatedDialogs.contains(key)) return;
+        // Bound fork metadata; excess forks can still be terminated without retaining them.
+        boolean remember = call.terminatedDialogs.size() < 16;
+        if (remember) call.terminatedDialogs.add(key);
+        try {
+            Request bye = dialog.createRequest(Request.BYE);
+            ClientTransaction tx = sipProvider.getNewClientTransaction(bye);
+            dialog.sendRequest(tx);
+            logCall(call, "BYE sent");
+        } catch (Exception e) {
+            if (remember) call.terminatedDialogs.remove(key);
+            throw e;
+        }
+    }
+
+    private void sendCancel(SipCall call) throws Exception {
+        if (call.cancelSent || call.inviteTx == null || !call.provisional) return;
+        Request cancel = call.inviteTx.createCancel();
+        ClientTransaction tx = sipProvider.getNewClientTransaction(cancel);
+        call.cancelSent = true;
+        try {
+            tx.sendRequest();
+            logCall(call, "CANCEL sent");
+        }
+        catch (Exception e) { call.cancelSent = false; throw e; }
     }
 
     public void hangup() throws Exception {
-        if (dialog != null) {
-            Request byeRequest = dialog.createRequest(Request.BYE);
-            ClientTransaction byeTransaction = sipProvider.getNewClientTransaction(byeRequest);
-            dialog.sendRequest(byeTransaction);
-            System.out.println("BYE请求已发送");
+        synchronized (calls) {
+            CallSession session = calls.active();
+            if (session != null) endLocal(sipCalls.get(session.getCallId()), "local-hangup");
         }
-        stopMedia();
+    }
+
+    private void endLocal(SipCall call, String reason) throws Exception {
+        if (call == null) return;
+        call.cancelWanted = true;
+        boolean waitingForAck = call.session.getDirection() == CallSession.Direction.INCOMING
+                && call.answerSent && !call.incomingAckReceived;
+        CallLifecycleManager.HangupAction action = calls.requestHangup(call.session);
+        logCall(call, "local end reason=" + reason + " action=" + action);
+        try {
+            if (action == CallLifecycleManager.HangupAction.BYE) sendBye(call, call.dialog);
+            else if (action == CallLifecycleManager.HangupAction.CANCEL) sendCancel(call);
+            else if (call.session.getDirection() == CallSession.Direction.INCOMING && !call.finalSent) {
+                Response declined = taggedResponse(Response.DECLINE, call.incomingRequest, call.localTag);
+                call.finalResponse = declined;
+                call.finalSent = true;
+                call.incomingTx.sendResponse(declined);
+            }
+            // Outgoing WAIT: RFC 3261 forbids CANCEL before the first provisional response.
+            // Incoming final 200: wait for ACK or the retained 32-second deadline before BYE.
+        } finally {
+            finishCall(call, reason);
+            if (waitingForAck) {
+                calls.armRetainedEndTimer(call.session,
+                        Math.max(32, intCfg("call.ack.timeout.sec", 32)) * 1000L, () -> {
+                            synchronized (calls) {
+                                if (call.incomingAckReceived) return;
+                                try { sendBye(call, call.dialog); }
+                                catch (Exception ignored) { System.err.println("Could not terminate unacknowledged old call"); }
+                            }
+                        });
+            }
+        }
+    }
+
+    private void activateMedia(SipCall call) {
+        if (!calls.claimMedia(call.session)) return;
+        mediaSession = call.session;
+        logCall(call, "media startup claimed");
+        videoCall = call.session.isVideo();
+        conferenceRoom = call.session.getConferenceRoom();
+        try {
+            if (call.remoteSdp == null || call.remoteSdp.trim().isEmpty()) {
+                throw new IllegalArgumentException("Missing remote SDP");
+            }
+            startMedia(call.remoteSdp);
+            if (!calls.isActive(call.session) || mediaSession != call.session) return;
+            markCallStart(call.session);
+            logCall(call, "media active");
+            notifyCall("active", call.session.getPeer());
+            calls.armAutoHangup(call.session, Math.max(1, CALL_DURATION_SEC) * 1000L, () -> {
+                synchronized (calls) {
+                    if (!calls.isActive(call.session)) return;
+                    try { endLocal(call, "auto-hangup"); }
+                    catch (Exception e) { finishCall(call, "auto-hangup"); }
+                }
+            });
+        } catch (Exception e) {
+            System.err.println("Media startup failed; ending this call");
+            try { sendBye(call, call.dialog); }
+            catch (Exception ignored) { System.err.println("Could not send BYE after media startup failure"); }
+            finishCall(call, "media-start-failed");
+        } catch (Error failure) {
+            // Native media linkage/VM errors must not strand the allocated RTP owner.
+            // Preserve and rethrow the original Error; cleanup failures remain inspectable.
+            try { sendBye(call, call.dialog); }
+            catch (Throwable cleanupFailure) {
+                if (cleanupFailure != failure) failure.addSuppressed(cleanupFailure);
+            }
+            try { finishCall(call, "media-start-error"); }
+            catch (Throwable cleanupFailure) {
+                if (cleanupFailure != failure) failure.addSuppressed(cleanupFailure);
+            }
+            throw failure;
+        }
+    }
+
+    private void finishCall(SipCall call, String reason) {
+        if (call == null) return;
+        if (calls.finish(call.session, reason)) logCall(call, "ended reason=" + reason);
+        if (calls.claimCleanup(call.session) && mediaSession == call.session) {
+            mediaSession = null;
+            cleanupSession = call.session;
+            try { stopMedia(); }
+            catch (RuntimeException e) { System.err.println("Media cleanup failed"); }
+            finally { cleanupSession = null; }
+        }
+        if (!call.endedNotified) {
+            call.endedNotified = true;
+            if (callStartMillis > 0 && loggedSession == call.session) {
+                EventLog.log("CALL_END", callDirection, callPeer,
+                        String.valueOf((System.currentTimeMillis() - callStartMillis) / 1000L));
+                callStartMillis = 0;
+                loggedSession = null;
+            }
+            notifyCall("ended", call.session.getPeer());
+        }
     }
 
     // ---------- 文字消息（SIP MESSAGE，RFC 3428）----------
@@ -1301,7 +1490,7 @@ public class SipVideoCallClient implements SipListener {
 
     /** 当前是否有媒体流在跑（即通话进行中） */
     private boolean isMediaActive() {
-        return rtpSender != null || rtpReceiver != null;
+        synchronized (calls) { return calls.active() != null || mediaSession != null; }
     }
 
     /** 启动控制台聊天：输入一行回车即发送，同时接收并显示对方消息 */
@@ -1409,227 +1598,361 @@ public class SipVideoCallClient implements SipListener {
     }
 
     @Override
-    public void processRequest(RequestEvent requestEvent) {
-        Request request = requestEvent.getRequest();
-        ServerTransaction serverTransaction = requestEvent.getServerTransaction();
-
-        System.out.println("\n收到请求: " + request.getMethod());
-
-        try {
-            if (request.getMethod().equals(Request.BYE)) {
-                if (serverTransaction == null) {
-                    serverTransaction = sipProvider.getNewServerTransaction(request);
-                }
-                Response response = messageFactory.createResponse(200, request);
-                serverTransaction.sendResponse(response);
-                System.out.println("通话已结束");
-                stopMedia();
-            } else if (request.getMethod().equals(Request.MESSAGE)) {
-                if (serverTransaction == null) {
-                    serverTransaction = sipProvider.getNewServerTransaction(request);
-                }
-                byte[] raw = request.getRawContent();
-                String text = (raw == null) ? "" : new String(raw, StandardCharsets.UTF_8);
-                FromHeader msgFrom = (FromHeader) request.getHeader(FromHeader.NAME);
-                String peer = peerOf(msgFrom);
-                if (text.startsWith("#FILE|")) {
-                    handleFileChunk(text, peer);
-                } else {
-                    String from = (msgFrom != null) ? msgFrom.getAddress().toString() : "未知";
-                    System.out.println("\n[收到消息] 来自 " + from + "：" + text);
-                    EventLog.log("MSG", "IN", peer, "TEXT:" + text.length());
-                    notifyMessage(peer, text, false);
-                }
-                Response response = messageFactory.createResponse(200, request);
-                serverTransaction.sendResponse(response);
-            } else if (request.getMethod().equals(Request.INVITE)) {
-                handleIncomingInvite(request, serverTransaction);
-            }
-        } catch (Exception e) {
-            e.printStackTrace();
+    public void processRequest(RequestEvent event) {
+        Request request = event.getRequest();
+        // File assembly/playback must not block CANCEL or BYE on the lifecycle monitor.
+        if (Request.MESSAGE.equals(request.getMethod())) {
+            try { handleIncomingMessage(event); }
+            catch (Exception e) { System.err.println("SIP MESSAGE handling failed"); }
+            return;
         }
-    }
-
-    /**
-     * 处理来电：自动接听。
-     *
-     * <p>流程：100 Trying -> 180 Ringing -> 200 OK（携带本机 SDP），
-     * 然后把对端 SDP 交给 startMedia 建立音频与视频通道。
-     *
-     * <p>本项目定位是课程演示客户端，所以采用"自动接听"而不是弹窗确认。
-     */
-    private void handleIncomingInvite(Request request, ServerTransaction tx) throws Exception {
-        if (tx == null) {
-            tx = sipProvider.getNewServerTransaction(request);
-        }
-
-        tx.sendResponse(messageFactory.createResponse(Response.TRYING, request));
-
-        FromHeader from = (FromHeader) request.getHeader(FromHeader.NAME);
-        System.out.println("\n[来电] 来自 " + ((from != null) ? from.getAddress() : "未知")
-                + "，自动接听...");
-        notifyCall("incoming", peerOf(from));
-
-        // Contact 头：告知对端本机的可达地址
-        SipURI contactURI = addressFactory.createSipURI(username, localIp);
-        contactURI.setPort(localPort);
-        Address contactAddress = addressFactory.createAddress(contactURI);
-
-        Response ringing = messageFactory.createResponse(Response.RINGING, request);
-        ringing.addHeader(headerFactory.createContactHeader(contactAddress));
-        tx.sendResponse(ringing);
-
-        // 先看主叫 SDP 里有没有 m=video，决定本次是否带视频
-        byte[] offer = request.getRawContent();
-        String remoteSdp = (offer == null) ? "" : new String(offer, StandardCharsets.UTF_8);
-        videoCall = VIDEO_ENABLED && remoteSdp.contains("m=video");
-
-        // 200 OK + 本机 SDP
-        Response ok = messageFactory.createResponse(Response.OK, request);
-        ok.addHeader(headerFactory.createContactHeader(contactAddress));
-        ContentTypeHeader ct = headerFactory.createContentTypeHeader("application", "sdp");
-        String localSdp = buildLocalSdp();
-        System.out.println("\n发出的SDP:\n" + localSdp);
-        ok.setContent(localSdp.getBytes(StandardCharsets.UTF_8), ct);
-        tx.sendResponse(ok);
-
-        if (dialog == null) {
-            dialog = tx.getDialog();
-        }
-        System.out.println("✓ 已接听，通话建立成功!");
-        markCallStart("IN", peerOf(from));
-        notifyCall("active", peerOf(from));
-
-        // 对端 SDP -> 建立媒体（音频 + 视频）
-        byte[] raw = request.getRawContent();
-        if (raw != null && raw.length > 0) {
-            startMedia(new String(raw, StandardCharsets.UTF_8));
-        }
-
-        // 达到设定通话时长后自动挂断
-        new Thread(() -> {
+        synchronized (calls) {
             try {
-                Thread.sleep(CALL_DURATION_SEC * 1000L);
-                System.out.println("\n通话达到 " + CALL_DURATION_SEC + " 秒，自动挂断...");
-                hangup();
+                if (Request.INVITE.equals(request.getMethod())) {
+                    handleIncomingInvite(event);
+                } else if (Request.ACK.equals(request.getMethod())) {
+                    handleIncomingAck(event);
+                } else if (Request.CANCEL.equals(request.getMethod())) {
+                    handleIncomingCancel(event);
+                } else if (Request.BYE.equals(request.getMethod())) {
+                    SipCall call = sipCalls.get(callId(request));
+                    boolean owned = ownsRequest(call, request)
+                            && (event.getDialog() == null || call.dialog == null
+                                || sameDialog(call.dialog, event.getDialog()));
+                    serverTransaction(event).sendResponse(messageFactory.createResponse(
+                            owned ? Response.OK : Response.CALL_OR_TRANSACTION_DOES_NOT_EXIST, request));
+                    if (owned) finishCall(call, "remote-bye");
+                }
             } catch (Exception e) {
-                // 对方提前挂断时会走到这里，属正常
+                System.err.println("SIP request handling failed: " + request.getMethod());
+                SipCall call = sipCalls.get(callId(request));
+                // A malformed foreign or re-INVITE request never terminates the current call.
+                if (Request.ACK.equals(request.getMethod()) && ownsRequest(call, request)
+                        && call.session.getState() != CallState.ESTABLISHED) {
+                    try { sendBye(call, call.dialog); } catch (Exception ignored) { }
+                    finishCall(call, "ack-processing-failed");
+                }
             }
-        }, "AutoHangupCallee").start();
+        }
     }
 
-    @Override
-    public void processResponse(ResponseEvent responseEvent) {
-        Response response = responseEvent.getResponse();
-        int statusCode = response.getStatusCode();
-        CSeqHeader cseq = (CSeqHeader) response.getHeader(CSeqHeader.NAME);
-        ClientTransaction clientTransaction = responseEvent.getClientTransaction();
+    /** Existing one-to-one and file MESSAGE handling is independent of call ownership. */
+    private void handleIncomingMessage(RequestEvent event) throws Exception {
+        Request request = event.getRequest();
+        ServerTransaction tx = serverTransaction(event);
+        byte[] raw = request.getRawContent();
+        String text = raw == null ? "" : new String(raw, StandardCharsets.UTF_8);
+        FromHeader from = (FromHeader) request.getHeader(FromHeader.NAME);
+        String peer = peerOf(from);
+        if (text.startsWith("#FILE|")) handleFileChunk(text, peer);
+        else {
+            String address = from == null ? "unknown" : from.getAddress().toString();
+            System.out.println("[收到消息] 来自 " + address + "：" + text);
+            EventLog.log("MSG", "IN", peer, "TEXT:" + text.length());
+            notifyMessage(peer, text, false);
+        }
+        tx.sendResponse(messageFactory.createResponse(Response.OK, request));
+    }
 
-        System.out.println("\n收到响应: " + statusCode + " " + response.getReasonPhrase() +
-                " (CSeq: " + cseq.getMethod() + ")");
+    private ServerTransaction serverTransaction(RequestEvent event) throws Exception {
+        return event.getServerTransaction() != null ? event.getServerTransaction()
+                : sipProvider.getNewServerTransaction(event.getRequest());
+    }
 
+    /** Auto-answer is preserved, but media starts only after the matching ACK. */
+    private void handleIncomingInvite(RequestEvent event) throws Exception {
+        Request request = event.getRequest();
+        ServerTransaction tx = serverTransaction(event);
+        SipCall existing = sipCalls.get(callId(request));
+        if (existing != null && existing.session.getDirection() == CallSession.Direction.INCOMING
+                && sequence(request) == existing.session.getInviteCSeq()
+                && tagEquals(existing.remoteTag, fromTag(request))
+                && Objects.equals(branch(request), branch(existing.incomingRequest))
+                && (Objects.equals(toTag(request), toTag(existing.incomingRequest))
+                    || tagEquals(existing.localTag, toTag(request)))) {
+            if (existing.finalResponse != null) tx.sendResponse(existing.finalResponse);
+            return;
+        }
+        // Renegotiation and unrelated callback dialogs must not borrow the active media.
+        if (toTag(request) != null) {
+            tx.sendResponse(messageFactory.createResponse(ownsRequest(existing, request)
+                    ? Response.NOT_ACCEPTABLE_HERE : Response.CALL_OR_TRANSACTION_DOES_NOT_EXIST, request));
+            return;
+        }
+        if (shuttingDown || calls.active() != null) {
+            tx.sendResponse(messageFactory.createResponse(Response.BUSY_HERE, request));
+            return;
+        }
+        String remoteTag = fromTag(request);
+        if (callId(request) == null || remoteTag == null || sequence(request) <= 0) {
+            tx.sendResponse(messageFactory.createResponse(Response.BAD_REQUEST, request));
+            return;
+        }
+        String sdp = request.getRawContent() == null ? ""
+                : new String(request.getRawContent(), StandardCharsets.UTF_8);
+        String localTag = UUID.randomUUID().toString();
+        FromHeader from = (FromHeader) request.getHeader(FromHeader.NAME);
+        CallSession session;
         try {
-            if (cseq.getMethod().equals(Request.REGISTER)) {
-                if (statusCode == Response.OK) {
-                    System.out.println("✓ 注册成功!");
-                    isRegistered = true;
-                } else if (statusCode == Response.UNAUTHORIZED) {
-                    System.out.println("需要认证，重新发送带认证的REGISTER");
-                    registerWithAuth(response);
-                }
-            } else if (cseq.getMethod().equals(Request.INVITE)) {
-                if (statusCode == Response.TRYING) {
-                    System.out.println("服务器正在处理呼叫...");
-                } else if (statusCode == Response.RINGING) {
-                    System.out.println("对方振铃中...");
-                    notifyCall("ringing", targetUser);
-                } else if (statusCode == Response.OK) {
-                    System.out.println("✓ 对方接听! 通话建立成功!");
-                    notifyCall("active", targetUser);
-
-                    if (dialog == null && clientTransaction != null) {
-                        dialog = clientTransaction.getDialog();
-                    }
-
-                    sendAck(response);
-
-                    // 启动音频流
-                    if (response.getContent() != null) {
-                        String remoteSdp = new String((byte[]) response.getContent());
-                        startMedia(remoteSdp);
-                    }
-
-                    // 达到设定通话时长后自动挂断
-                    new Thread(() -> {
-                        try {
-                            Thread.sleep(CALL_DURATION_SEC * 1000L);
-                            System.out.println("\n通话达到 " + CALL_DURATION_SEC + " 秒，自动挂断...");
-                            hangup();
-                        } catch (Exception e) {
-                            e.printStackTrace();
+            session = calls.beginIncoming(callId(request), sequence(request), branch(request),
+                    peerOf(from), VIDEO_ENABLED && sdp.contains("m=video"), null);
+        } catch (IllegalArgumentException e) {
+            tx.sendResponse(messageFactory.createResponse(Response.CALL_OR_TRANSACTION_DOES_NOT_EXIST, request));
+            return;
+        }
+        SipCall call = new SipCall(session, localTag, remoteTag);
+        call.incomingRequest = request;
+        call.incomingTx = tx;
+        call.remoteSdp = sdp;
+        remember(call);
+        logCall(call, "incoming INVITE received");
+        notifyCall("incoming", session.getPeer());
+        try {
+            tx.sendResponse(messageFactory.createResponse(Response.TRYING, request));
+            if (!calls.isActive(session)) return;
+            Response ringing = taggedResponse(Response.RINGING, request, localTag);
+            ringing.addHeader(localContact());
+            tx.sendResponse(ringing);
+            // A reentrant CANCEL from a transaction test/provider can finish the early dialog.
+            if (!calls.isActive(session)) return;
+            Response ok = taggedResponse(Response.OK, request, localTag);
+            ok.addHeader(localContact());
+            ok.setContent(buildLocalSdp(session.isVideo()).getBytes(StandardCharsets.UTF_8),
+                    headerFactory.createContentTypeHeader("application", "sdp"));
+            call.finalResponse = ok;
+            call.finalSent = true;
+            call.answerSent = true;
+            calls.awaitingAck(session);
+            call.dialog = tx.getDialog() != null ? tx.getDialog() : event.getDialog();
+            calls.armTimer(session, CallLifecycleManager.TimerKind.ACK_DEADLINE,
+                    Math.max(32, intCfg("call.ack.timeout.sec", 32)) * 1000L, () -> {
+                        synchronized (calls) {
+                            if (!calls.isActive(session)) return;
+                            call.cancelWanted = true;
+                            try { sendBye(call, call.dialog); } catch (Exception ignored) { }
+                            finishCall(call, "ack-timeout");
                         }
-                    }).start();
-
-                } else if (statusCode == Response.UNAUTHORIZED || statusCode == Response.PROXY_AUTHENTICATION_REQUIRED) {
-                    System.out.println("INVITE需要认证，重新发送");
-                    inviteWithAuth(response, clientTransaction);
-                } else if (statusCode == Response.BUSY_HERE) {
-                    System.out.println("对方忙");
-                } else if (statusCode == Response.DECLINE) {
-                    System.out.println("对方拒绝");
-                } else if (statusCode >= 400) {
-                    System.out.println("呼叫失败: " + statusCode);
-                }
-            } else if (cseq.getMethod().equals(Request.BYE)) {
-                if (statusCode == Response.OK) {
-                    System.out.println("通话已正常结束");
-                }
-            }
+                    });
+            tx.sendResponse(ok);
         } catch (Exception e) {
-            e.printStackTrace();
+            finishCall(call, "answer-send-failed");
+            throw e;
         }
     }
 
-    @Override
-    public void processTimeout(TimeoutEvent timeoutEvent) {
-        System.out.println("请求超时");
+    private Response taggedResponse(int status, Request request, String localTag) throws Exception {
+        Response response = messageFactory.createResponse(status, request);
+        ToHeader to = (ToHeader) response.getHeader(ToHeader.NAME);
+        if (to != null) to.setTag(localTag);
+        return response;
+    }
 
-        // 注册超时通常意味着服务器刚重启或暂时不可达。
-        // 这里 30 秒后立即重试，服务器一恢复就能很快重新注册上，
-        // 而不用干等到下一个重注册周期。
-        try {
-            ClientTransaction tx = timeoutEvent.getClientTransaction();
-            if (tx != null && tx.getRequest() != null
-                    && Request.REGISTER.equals(tx.getRequest().getMethod())) {
-                System.out.println("[注册超时] 30 秒后自动重试注册...");
-                Thread retry = new Thread(() -> {
-                    try {
-                        Thread.sleep(30000);
-                        register();
-                    } catch (Exception e) {
-                        System.err.println("重试注册失败: " + e.getMessage());
+    private void handleIncomingAck(RequestEvent event) throws Exception {
+        Request request = event.getRequest();
+        SipCall call = sipCalls.get(callId(request));
+        if (call == null || call.session.getDirection() != CallSession.Direction.INCOMING
+                || !call.answerSent || !ownsRequest(call, request)
+                || sequence(request) != call.session.getInviteCSeq()) return;
+        if (event.getDialog() != null) {
+            if (call.dialog != null && !sameDialog(call.dialog, event.getDialog())) return;
+            call.dialog = event.getDialog();
+        }
+        call.incomingAckReceived = true;
+        logCall(call, "matching ACK received");
+        calls.cancelTimer(call.session, CallLifecycleManager.TimerKind.END_DEADLINE);
+        CallLifecycleManager.AcceptResult result = calls.acknowledged(call.session);
+        if (result == CallLifecycleManager.AcceptResult.START_MEDIA) activateMedia(call);
+        else if (result == CallLifecycleManager.AcceptResult.TERMINATE_LATE) sendBye(call, call.dialog);
+    }
+
+    private void handleIncomingCancel(RequestEvent event) throws Exception {
+        Request cancel = event.getRequest();
+        SipCall call = sipCalls.get(callId(cancel));
+        boolean matches = call != null && call.session.getDirection() == CallSession.Direction.INCOMING
+                && sequence(cancel) == call.session.getInviteCSeq()
+                && tagEquals(call.remoteTag, fromTag(cancel))
+                && Objects.equals(branch(cancel), branch(call.incomingRequest))
+                && (toTag(cancel) == null || tagEquals(call.localTag, toTag(cancel)));
+        serverTransaction(event).sendResponse(messageFactory.createResponse(matches ? Response.OK
+                : Response.CALL_OR_TRANSACTION_DOES_NOT_EXIST, cancel));
+        if (!matches || call.finalSent) return; // CANCEL cannot revoke a final 200.
+        Response terminated = taggedResponse(Response.REQUEST_TERMINATED, call.incomingRequest, call.localTag);
+        call.finalResponse = terminated;
+        call.finalSent = true;
+        call.incomingTx.sendResponse(terminated);
+        finishCall(call, "remote-cancel");
+    }
+
+    @Override
+    public void processResponse(ResponseEvent event) {
+        Response response = event.getResponse();
+        CSeqHeader cseq = (CSeqHeader) response.getHeader(CSeqHeader.NAME);
+        if (cseq == null) return;
+        synchronized (calls) {
+            try {
+                if (Request.REGISTER.equals(cseq.getMethod())) {
+                    if (shuttingDown) return;
+                    if (response.getStatusCode() == Response.OK) isRegistered = true;
+                    else if (response.getStatusCode() == Response.UNAUTHORIZED) registerWithAuth(response);
+                } else if (Request.INVITE.equals(cseq.getMethod())) {
+                    handleInviteResponse(event);
+                }
+                // CANCEL/BYE responses belong to already-cleaned old transactions. They never
+                // terminate a new session, including 200 CANCEL followed by 487 INVITE.
+            } catch (Exception e) {
+                System.err.println("SIP response handling failed: " + cseq.getMethod());
+                SipCall call = sipCalls.get(callId(response));
+                if (matchesResponse(call, response) && calls.isActive(call.session)
+                        && call.session.getState() != CallState.ESTABLISHED
+                        && sequence(response) == call.session.getInviteCSeq()) {
+                    if (response.getStatusCode() >= 200 && response.getStatusCode() < 300) {
+                        try { sendBye(call, call.dialog); } catch (Exception ignored) { }
                     }
-                }, "RegisterRetry");
-                retry.setDaemon(true);
-                retry.start();
+                    finishCall(call, "response-processing-failed");
+                }
             }
-        } catch (Exception e) {
-            // 拿不到事务信息时忽略，不影响主流程
+        }
+    }
+
+    private void handleInviteResponse(ResponseEvent event) throws Exception {
+        Response response = event.getResponse();
+        SipCall call = sipCalls.get(callId(response));
+        if (!matchesResponse(call, response)) {
+            if (call == null && response.getStatusCode() >= 200 && response.getStatusCode() < 300)
+                terminateUntrackedSuccess(event);
+            return;
+        }
+        ClientTransaction tx = event.getClientTransaction();
+        int status = response.getStatusCode();
+        logCall(call, "INVITE response status=" + status + " responseSeq=" + sequence(response));
+        boolean currentAttempt = sequence(response) == call.session.getInviteCSeq()
+                && (tx == null || tx == call.inviteTx
+                    || calls.matchesInvite(call.session, sequence(response), tx.getBranchId()));
+        if (status >= 200 && status < 300) {
+            Dialog dialog = event.getDialog();
+            if (dialog == null && tx != null) dialog = tx.getDialog();
+            if (dialog == null && tagEquals(call.acceptedRemoteTag, toTag(response))) dialog = call.dialog;
+            // A 2xx ACK is end-to-end and must be retransmitted for every duplicate 2xx.
+            if (!validResponseDialog(dialog, response)) return;
+            boolean fork = call.acceptedRemoteTag != null
+                    && !tagEquals(call.acceptedRemoteTag, toTag(response));
+            if (currentAttempt && !fork && call.dialog == null) call.dialog = dialog;
+            sendAck(dialog, response);
+            if (!currentAttempt || fork) {
+                sendBye(call, dialog);
+                return;
+            }
+            if (call.acceptedRemoteTag == null) call.acceptedRemoteTag = toTag(response);
+            call.dialog = dialog;
+            call.remoteSdp = response.getRawContent() == null ? ""
+                    : new String(response.getRawContent(), StandardCharsets.UTF_8);
+            CallLifecycleManager.AcceptResult result = calls.accepted(call.session);
+            if (call.cancelWanted || result == CallLifecycleManager.AcceptResult.TERMINATE_LATE) {
+                sendBye(call, dialog);
+                finishCall(call, "late-accept-after-end");
+            } else if (result == CallLifecycleManager.AcceptResult.START_MEDIA) activateMedia(call);
+            return;
+        }
+        if (!currentAttempt || call.session.getState() == CallState.ESTABLISHED
+                || call.acceptedRemoteTag != null) return;
+        if (status < 200) {
+            call.provisional = true;
+            calls.provisional(call.session);
+            if (call.cancelWanted) sendCancel(call);
+            else if (status == Response.RINGING && calls.ringing(call.session))
+                notifyCall("ringing", call.session.getPeer());
+            return;
+        }
+        if (status == Response.UNAUTHORIZED || status == Response.PROXY_AUTHENTICATION_REQUIRED) {
+            if (!call.cancelWanted && calls.isActive(call.session)) inviteWithAuth(response, call);
+            else finishCall(call, "authentication-after-end");
+        } else {
+            finishCall(call, "invite-failed-" + status);
+        }
+    }
+
+    private void terminateUntrackedSuccess(ResponseEvent event) throws Exception {
+        Response response = event.getResponse();
+        Dialog dialog = event.getDialog();
+        if (dialog == null && event.getClientTransaction() != null)
+            dialog = event.getClientTransaction().getDialog();
+        // Only the stack's own matching Dialog can authorize cleanup of a pruned late 2xx.
+        if (!validResponseDialog(dialog, response)) return;
+        sendAck(dialog, response);
+        String key = callId(response) + "/" + fromTag(response) + "/" + toTag(response);
+        if (orphanEndedDialogs.containsKey(key)) return;
+        Request bye = dialog.createRequest(Request.BYE);
+        dialog.sendRequest(sipProvider.getNewClientTransaction(bye));
+        orphanEndedDialogs.put(key, Boolean.TRUE);
+        if (orphanEndedDialogs.size() > 64) orphanEndedDialogs.remove(orphanEndedDialogs.keySet().iterator().next());
+    }
+
+    private boolean validResponseDialog(Dialog dialog, Response response) {
+        return dialog != null && dialog.getCallId() != null
+                && Objects.equals(dialog.getCallId().getCallId(), callId(response))
+                && tagEquals(fromTag(response), dialog.getLocalTag())
+                && tagEquals(toTag(response), dialog.getRemoteTag());
+    }
+
+    @Override
+    public void processTimeout(TimeoutEvent event) {
+        if (event.getTimeout() != Timeout.TRANSACTION) return;
+        synchronized (calls) {
+            ClientTransaction tx = event.getClientTransaction();
+            if (tx != null && tx.getRequest() != null) {
+                Request request = tx.getRequest();
+                if (Request.INVITE.equals(request.getMethod())) {
+                    SipCall call = sipCalls.get(callId(request));
+                    if (call != null && tx == call.inviteTx && calls.isActive(call.session)
+                            && call.session.getState() != CallState.ESTABLISHED
+                            && calls.matchesInvite(call.session, sequence(request), tx.getBranchId()))
+                        finishCall(call, "invite-transaction-timeout");
+                } else if (Request.REGISTER.equals(request.getMethod()) && !shuttingDown) {
+                    Thread retry = new Thread(() -> {
+                        try {
+                            Thread.sleep(30000);
+                            if (!shuttingDown) register();
+                        } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                        catch (Exception e) { System.err.println("Registration retry failed"); }
+                    }, "RegisterRetry");
+                    retry.setDaemon(true);
+                    retry.start();
+                }
+            } else if (event.isServerTransaction()) {
+                ServerTransaction server = event.getServerTransaction();
+                if (server != null && server.getRequest() != null) {
+                    SipCall call = sipCalls.get(callId(server.getRequest()));
+                    if (call != null && server == call.incomingTx && calls.isActive(call.session)
+                            && call.session.getState() != CallState.ESTABLISHED) {
+                        if (call.answerSent) {
+                            try { sendBye(call, call.dialog); } catch (Exception ignored) { }
+                        }
+                        finishCall(call, "incoming-transaction-timeout");
+                    }
+                }
+            }
         }
     }
 
     @Override
-    public void processIOException(IOExceptionEvent exceptionEvent) {
-        System.out.println("IO异常: " + exceptionEvent);
+    public void processIOException(IOExceptionEvent event) {
+        // JAIN IOExceptionEvent has an endpoint, not a call identity. A shared-proxy I/O
+        // event must not kill an unrelated call; its scoped deadline/timeout handles it.
+        System.err.println("SIP transport I/O error; waiting for the matching transaction deadline");
     }
 
     @Override
-    public void processTransactionTerminated(TransactionTerminatedEvent transactionTerminatedEvent) {
-        // 正常事务终止，不输出
+    public void processTransactionTerminated(TransactionTerminatedEvent event) {
+        // Successful INVITE transactions can terminate while their dialog is still active.
     }
 
     @Override
-    public void processDialogTerminated(DialogTerminatedEvent dialogTerminatedEvent) {
-        System.out.println("对话终止");
+    public void processDialogTerminated(DialogTerminatedEvent event) {
+        synchronized (calls) {
+            Dialog dialog = event.getDialog();
+            if (dialog == null || dialog.getCallId() == null) return;
+            SipCall call = sipCalls.get(dialog.getCallId().getCallId());
+            if (call != null && sameDialog(call.dialog, dialog)) finishCall(call, "dialog-terminated");
+        }
     }
 }

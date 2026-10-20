@@ -67,6 +67,11 @@ video.relay.port=9100
 # ---------- 通话行为 ----------
 # 通话时长（秒），到时自动挂断
 call.duration.sec=180
+# Lifecycle deadlines: outgoing INVITE defaults to 64 seconds.
+# Incoming 200 OK waits at least 32 seconds for ACK before BYE cleanup.
+# Existing non-positive call.duration.sec is clamped to 1 second, not treated as disable.
+call.invite.timeout.sec=64
+call.ack.timeout.sec=32
 # 启动后是否自动呼叫被叫；只测文字消息时改成 false，避免启动就拨号
 call.auto.invite=true
 

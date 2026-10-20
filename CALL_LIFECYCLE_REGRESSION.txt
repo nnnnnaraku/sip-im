@@ -1,0 +1,222 @@
+SIP CALL LIFECYCLE — independent change and manual regression
+Base: main 1cc201761921ddb668f159741c87df5ace7d35b6
+Branch: fix/call-lifecycle
+Worktree: D:\Projects\sip-im-call-lifecycle
+No audio P0, group, file-security, Web-security or video-diagnostic code is included.
+
+1. Actual baseline defects
+- A global Dialog and INVITE ClientTransaction were reused by all calls.
+- Every successful INVITE response/incoming acceptance created a sleeping auto-hangup thread.
+  It later called unqualified hangup(), so an old timer could end a new call.
+- Every 200 OK could restart media/timing; hangup before establishment attempted BYE rather
+  than performing the INVITE CANCEL flow.
+- Busy/reject/error/timeout and DialogTerminated paths did not finish the matching call.
+- Authentication retried with a fresh Call-ID, From tag and mutable selected contact.
+- Media allocation errors were swallowed; partly allocated sockets/devices could survive.
+- Microphone workers read shared mutable device fields; video UDP interrupt did not unblock receive.
+- Conference startup could leak the first socket when allocating the second socket failed.
+
+2. State and ownership
+New independent classes:
+  CallState: DIALING, RINGING, ACCEPTED (incoming 200 sent, waiting for ACK),
+             ESTABLISHED, ENDING, ENDED.
+  CallSession: unique application UUID; SIP Call-ID; immutable peer/direction/video/room;
+               current INVITE CSeq/branch; timestamps and terminal reason.
+  CallLifecycleManager: single active slot, guarded transitions, exactly-once media/cleanup,
+                        injectable Scheduler/clock, cancelled-task removal and bounded history.
+
+Normal outbound:
+  begin -> DIALING -> provisional/RINGING -> valid 2xx -> ACK -> ESTABLISHED
+  -> media once -> one auto-hangup -> BYE/remote BYE/failure -> ENDED.
+Normal inbound:
+  INVITE -> RINGING -> tagged 200/ACCEPTED -> matching ACK -> ESTABLISHED -> media once.
+Active peer and media intent are independent of the currently selected chat contact.
+
+SipVideoCallClient retains JAIN objects in a per-call binding; request matching includes
+Call-ID, local/remote tags, INVITE CSeq and transaction/branch where available.
+Unknown BYE/CANCEL or wrong tags return 481 instead of ending the active call.
+A second independent incoming call returns 486. Existing in-dialog renegotiation is rejected
+with 488, keeping the original call. Duplicate initial INVITE replays its cached final result.
+This is a single simultaneous SIP call client, not a new call-waiting/re-INVITE framework.
+
+3. Timers and signalling races
+- The scheduler is a daemon ScheduledThreadPoolExecutor with remove-on-cancel enabled.
+- Every timer captures a CallSession and registration; cancelled/already-fired/stale callbacks
+  are ignored, and the SIP adapter rechecks identity after acquiring the same lifecycle monitor.
+- Local hangup releases the active slot and physical media without waiting for remote responses.
+  The old binding stays available for late signalling; immediate redial can use a fresh Dialog.
+- Before any provisional response, CANCEL intent is recorded but not sent. The first matching
+  1xx sends one CANCEL for the original transaction.
+- An INVITE 2xx winning the CANCEL race is ACKed, then BYE'd, without starting old media.
+- Every repeated valid 2xx is ACKed; media and timer are not allocated again.
+- Other fork dialogs are ACKed/BYE'd and never replace the primary media.
+- An already established call ignores late INVITE provisional/error/transaction-timeout events.
+  A failed duplicate/fork ACK or fork BYE does not end the healthy primary dialog.
+- Incoming local hangup after 200 but before ACK waits for ACK before BYE. A retained end timer
+  handles missing ACK, scoped to that old binding even while another call is active.
+- Incoming ACK timeout closes its confirmed dialog with BYE; repeated or malformed ACK does
+  not create media. Authentication preserves request identity and is limited to two retries.
+- MESSAGE/file dispatch remains outside the lifecycle monitor; signalling serialization does
+  not newly hold that lock during ordinary message/file reassembly or disk writes.
+
+Protocol references checked against RFC 3261:
+  https://www.rfc-editor.org/rfc/rfc3261.html#section-9.1
+  https://www.rfc-editor.org/rfc/rfc3261.html#section-13.2.2.4
+  https://www.rfc-editor.org/rfc/rfc3261.html#section-13.3.1.4
+  https://www.rfc-editor.org/rfc/rfc3261.html#section-15
+
+4. Media changes (ownership only, no codec/protocol redesign)
+- Startup failure is propagated to the lifecycle adapter; partial resources are unwound.
+- stopMedia performs physical cleanup only. Statistics and UI end notification belong to
+  finishCall(session), so an old call cannot finish the next call's log record.
+- Microphone/video/level-monitor callbacks capture their own session and device objects.
+  A stopped old worker cannot adopt a new sender/camera/window via shared fields.
+- Audio receiver constructor failure closes the UDP socket and partial speaker allocation.
+  Stop closes receive socket before joining; it never waits in speaker.drain().
+- Microphone runs bind their own line/listener; line/speaker closure is once per lifetime.
+- Video receiver stop closes its socket to release blocked DatagramSocket.receive().
+- ConferenceVideo rolls back partial startup, stops a partly opened camera before receive-only
+  fallback, closes both sockets and ends workers. A stopped instance cannot be restarted.
+- Existing camera-unavailable receive-only behavior is retained.
+- Logs identify application UUID/Call-ID/CSeq/state/peer and termination reason, with bounded
+  identifiers and no authentication contents. Media-stop logs retain packet/frame counters.
+
+5. Configuration
+No SIP account, password, server, room, firewall or UDP9101 settings were changed.
+Existing call.duration.sec remains the auto-hangup setting (default180; minimum1 second).
+Two optional properties are documented in config.properties.example:
+  call.invite.timeout.sec=64
+  call.ack.timeout.sec=32
+Outgoing INVITE wait has minimum1 second. Incoming ACK cleanup waits at least32 seconds.
+They are application deadlines, not a change to JAIN SIP transaction timer constants.
+Non-positive values are clamped, not used as a timer-disable switch.
+
+6. Reproduce isolated automated verification
+Tests use real JAIN header/message objects plus transaction/provider/Dialog proxies.
+No SipStack.init, SIP registration, microphone, real camera, miniSIPServer or VideoRelay runs.
+Resource tests use temporary ephemeral loopback UDP sockets and fake device lines/cameras.
+
+PowerShell, session-scoped environment:
+  Set-Location D:\Projects\sip-im-call-lifecycle
+  $env:JAVA_HOME='C:\Users\21702\.jdks\corretto-1.8.0_504'
+  $env:PATH=$env:JAVA_HOME+'\bin;'+$env:PATH
+  $env:MAVEN_OPTS='-Dfile.encoding=UTF-8'
+  & 'D:\IntelliJ IDEA 2026.2.3\plugins\maven-plugin\lib\maven3\bin\mvn.cmd' package
+  git diff --check
+
+Actual offline build additionally uses:
+  -o -gs target\lifecycle-settings.xml -s target\lifecycle-settings.xml
+  -Dmaven.repo.local=<absolute worktree>\target\lifecycle-maven-repository
+Only an isolated copy of the existing Maven cache is used; no downloads/install/global changes.
+POM changes add only JUnit4.13.2 and Surefire3.5.4, matching the other independent branches.
+Evidence: target\lifecycle-evidence\full-package.log and target\surefire-reports.
+Runtime dependencies may be collected offline with the already cached
+org.apache.maven.plugins:maven-dependency-plugin:3.6.1:copy-dependencies goal.
+No skipped tests or relaxed assertions are used.
+
+7. Manual regression — NOT_RUN until explicitly scheduled/authorized
+Prepare the same reviewed JAR/runtime dependencies on the intended test computers, in a NEW
+private run directory. Preserve all original packages/configs. Supply existing credentials
+privately; do not alter server users/passwords/rooms. Disable call.auto.invite in the COPY.
+Build/dependency collection alone does not launch services:
+  & '<existing Maven>\bin\mvn.cmd' package org.apache.maven.plugins:maven-dependency-plugin:3.6.1:copy-dependencies -DincludeScope=runtime -DoutputDirectory=target/lib
+
+The following runtime commands are instructions only, NOT executed by this task:
+  & '<JDK8>\bin\java.exe' '-Dfile.encoding=UTF-8' '-Dsip.config=<private absolute config>' -cp '<worktree>\target\sipvideo-1.0-SNAPSHOT.jar;<worktree>\target\lib\*' org.example.WebClientServer
+  # CLI alternative (starts the same SIP engine):
+  & '<JDK8>\bin\java.exe' '-Dfile.encoding=UTF-8' '-Dsip.config=<private absolute config>' -cp '<worktree>\target\sipvideo-1.0-SNAPSHOT.jar;<worktree>\target\lib\*' org.example.SipVideoCallClient
+These commands WILL register and may start configured media; wait for separate authorization.
+
+Use PASS/FAIL/BLOCKED/NOT_RUN independently for each direction/case:
+[NOT_RUN] A100 calls B101 and B101 calls A100: 180,200,ACK; media once; hangup,BYE,200.
+[NOT_RUN] Hangup immediately before1xx and during ringing: CANCEL sent only after1xx;
+          200 CANCEL and487 INVITE do not end a subsequently redialed call.
+[NOT_RUN] CANCEL vs final200 race: ACK+BYE on old Call-ID, no old media, new call unaffected.
+[NOT_RUN] B busy/reject/unreachable: end status, no media/ports left, A can redial immediately.
+[NOT_RUN] Duplicated2xx and missing/reordered responses in an approved network test:
+          ACK repeats, media/timer do not repeat; no unapproved server/firewall changes.
+[NOT_RUN] End early, redial, then wait past the OLD auto-hangup time: new call must continue.
+[NOT_RUN] Repeat setup/hangup20 times: no BindException, stale video, microphone or receiver.
+[NOT_RUN] Microphone/camera unavailable and RTP bind failure: allocated resources close;
+          camera-only failure retains receive-only behavior, audio failure terminates its call.
+[NOT_RUN] B hangs up: A releases media once; late old BYE/DialogTerminated does not affect redial.
+[NOT_RUN] Incoming ACK absent: no media; BYE cleanup after the ACK deadline.
+[NOT_RUN] Normal call -> existing room *6*1 -> normal call: fresh Dialog/media/room each time.
+[NOT_RUN] Conference leave/rejoin and A/B/C join orders: no stale callbacks/old participant display.
+[NOT_RUN] Four message types, page controls/SSE and real administrative call-duration statistics
+          continue to work (those modules were not changed but runtime compatibility needs evidence).
+
+IMPORTANT miniSIPServer meeting boundary:
+An old source comment mentions the server "calling back" during meeting dialing, but does not
+prove whether it is a duplicate INVITE, in-dialog re-INVITE or second independent dialog.
+Capture Call-ID/from-tag/to-tag/CSeq for the actual room. This branch deliberately rejects
+an unrelated second active dialog and unsupported renegotiation instead of borrowing media.
+If the deployment requires such a callback, mark meeting regression BLOCKED, retain the
+known working package and design that specific integration separately; do not weaken identity
+checks or claim conference compatibility from these automated tests.
+
+Evidence per case: exact commit/JAR hashes, private configuration fingerprint (no password),
+JDK/OS/actual IP, timestamps, Call-ID/tags/CSeq, CANCEL/ACK/BYE status, UI observations,
+audio/video counters, post-end socket/device observations and each human participant's result.
+Do not archive credentials, raw authentication headers or private config contents.
+Real audio clarity and video movement require human confirmation, not nonzero packet counters.
+
+8. Merge boundaries and rollback
+Audio P0 ce2a3c3: SipVideoCallClient media/SDP paths and RTPAudioReceiver constructors/stop overlap.
+Keep lifecycle identity/claim/cleanup guards OUTSIDE media, while retaining P0's G711Codec,
+PCMA/PCMU selection, AudioSdp negotiation and RTP PT validation INSIDE the media implementation.
+Do not merge by choosing this branch's complete baseline codec/SDP methods.
+This independent branch still has main's known codec/SDP limitations and DOES NOT fix audio noise.
+There is no architectural dependency on audio P0 for the lifecycle fix.
+
+Video diagnostics: ConferenceVideo and per-call camera/video callback/cleanup areas overlap.
+Preserve diagnostics, counters/test-source/source selection and protocol from that branch;
+apply the session owner fence and partial-allocation cleanup without overwriting them.
+VideoRelay and its UDP protocol are unchanged here.
+
+Group/file-security branches overlap SipVideoCallClient MESSAGE dispatch.
+Keep their group/file validation/dispatch while leaving it OUTSIDE the lifecycle monitor.
+Web-security changes are not included; retain their guarded HTTP routes when later integrating.
+POM JUnit/Surefire configuration is intentionally compatible and should be deduplicated on merge.
+After integration run the combined complete suites and real A/B/C regression before freeze.
+
+Rollback: stop ONLY the new test process (CLI /quit for orderly shutdown; Ctrl+C stops the
+specific console process), then use the untouched original package and private configuration.
+No server/account/firewall/database rollback is needed. Do not kill all Java processes.
+A process exit still relies on OS socket/device closure; registration expiry remains server policy.
+
+9. Known limits
+- Exactly one simultaneous SIP call; no call waiting, transfer, hold or general re-INVITE support.
+- Automatic answer remains enabled; no new manual accept/decline UI is added.
+- Up to64 call bindings are retained. Beyond bounded history, a late valid stack-owned Dialog
+  can still be ACKed/BYE'd without claiming media; no unbounded historical call store is added.
+- JAIN SIP handles normal transaction retransmission. Automated proxies do not prove stack,
+  NAT, miniSIPServer callback behavior, real codec interoperability or real hardware release.
+- IOExceptionEvent has an endpoint, not reliable call identity. It is logged, while scoped
+  transaction/application deadlines handle teardown; a shared-proxy I/O error does not kill
+  an unrelated active dialog.
+- Slow synchronous Web SSE/UI callbacks can still delay the lifecycle monitor. Bounded
+  asynchronous Web delivery is a separate task; MESSAGE/file disk work is not under that lock.
+- Driver/native calls may hang despite close/interrupt. Workers use bounded joins and are
+  fenced from new session resources; this is not a guarantee against a defective native driver.
+- A BYE send failure releases local media/slot, but cannot guarantee remote teardown until
+  transport recovery/server expiry. Tests prove local ownership, not remote delivery.
+- This branch does not contain the independent audio, Web, file, group or camera diagnostics fixes.
+
+10. Actual verification (2026-10-20)
+Corretto 1.8.0_504-b04; Maven3.9.16; complete offline package: PASS.
+117 tests: 0 failures, 0 errors, 0 skipped:
+  CallLifecycleManagerTest: 55
+  MediaResourceCleanupTest: 18
+  SipCallLifecycleIntegrationTest: 44
+Every production class (49 files) was checked: Java class major version52, PASS.
+Runtime dependency collection: 8 JARs, PASS.
+git diff --check: PASS.
+Earlier full suite found an actual JAIN Via.setBranch(null) authentication-retry failure;
+the implementation now removes the branch parameter before creating the next transaction.
+The full suite was rerun after all fixes; assertions were not weakened and no test was skipped.
+The SIP/device error log lines in this run include deliberate failure-injection tests.
+
+JAR: target\sipvideo-1.0-SNAPSHOT.jar
+SHA-256: 8CFB4183EA36988DFF88A71E275AED8E1C18FE9DD2A155D4D895159F3424F61F
+Real SIP registration/media/miniSIPServer/A-B-C/manual acceptance: NOT_RUN.

@@ -24,6 +24,7 @@ public class RtpVideoReceiver {
 
     private volatile boolean running = false;
     private Thread thread;
+    private boolean stopped;
 
     /** 当前正在重组的帧：偏移 -> 数据 */
     private final TreeMap<Integer, byte[]> fragments = new TreeMap<>();
@@ -34,15 +35,19 @@ public class RtpVideoReceiver {
     private volatile long droppedFrames = 0;
 
     public RtpVideoReceiver(DatagramSocket socket, FrameListener listener) {
+        if (socket == null || socket.isClosed()) throw new IllegalArgumentException("Open video socket required");
         this.socket = socket;
         this.listener = listener;
     }
 
-    public void start() {
+    public synchronized void start() {
+        if (stopped || socket.isClosed()) throw new IllegalStateException("Video receiver has stopped");
+        if (running) return;
         running = true;
         thread = new Thread(this::loop, "RtpVideoReceiver");
         thread.setDaemon(true);
-        thread.start();
+        try { thread.start(); }
+        catch (RuntimeException | Error failure) { running = false; stopped = true; socket.close(); throw failure; }
     }
 
     private void loop() {
@@ -51,6 +56,7 @@ public class RtpVideoReceiver {
             try {
                 DatagramPacket packet = new DatagramPacket(buf, buf.length);
                 socket.receive(packet);
+                if (!running) return;
 
                 int len = packet.getLength();
                 if (len < 14) continue; // 12 字节 RTP 头 + 2 字节偏移
@@ -84,7 +90,7 @@ public class RtpVideoReceiver {
                         if (frame != null) {
                             framesReceived++;
                             lastFrameSize = frame.length;
-                            if (listener != null) listener.onFrame(frame);
+                            if (running && listener != null) listener.onFrame(frame);
                         } else {
                             droppedFrames++;
                         }
@@ -92,6 +98,7 @@ public class RtpVideoReceiver {
                 }
             } catch (Exception e) {
                 if (running) System.err.println("视频接收异常: " + e.getMessage());
+                if (socket.isClosed()) { running = false; return; }
             }
         }
     }
@@ -109,8 +116,25 @@ public class RtpVideoReceiver {
     }
 
     public void stop() {
-        running = false;
-        if (thread != null) thread.interrupt();
+        final Thread receiving;
+        synchronized (this) {
+            stopped = true;
+            running = false;
+            receiving = thread;
+        }
+        // Interrupt alone does not release DatagramSocket.receive().
+        socket.close();
+        if (receiving != null) receiving.interrupt();
+        if (receiving != null && receiving != Thread.currentThread()) {
+            try { receiving.join(1000); }
+            catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
+        }
+        if (receiving == null || !receiving.isAlive() || receiving == Thread.currentThread()) {
+            synchronized (fragments) {
+                fragments.clear();
+                currentTimestamp = -1;
+            }
+        }
     }
 
     public long getFramesReceived() {

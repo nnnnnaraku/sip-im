@@ -48,13 +48,23 @@ public class ConferenceVideo {
     private final int fps;
     private final float quality;
     private final Listener listener;
+    interface ResourceFactory {
+        DatagramSocket socket() throws Exception;
+        VideoCapture capture(int width, int height);
+    }
+    private final ResourceFactory resources;
+    private boolean started;
+    private boolean stopped;
+    private Thread receiveThread;
+    private Thread sendThread;
+    private Thread heartbeatThread;
 
     /** 只负责接收 */
     private DatagramSocket recvSocket;
     /** 只负责发送（JOIN / FRAME / LEAVE） */
     private DatagramSocket sendSocket;
     private InetAddress relayAddr;
-    private VideoCapture capture;
+    private volatile VideoCapture capture;
     private volatile boolean running;
 
     /** 统计：便于排障（不依赖界面） */
@@ -66,6 +76,18 @@ public class ConferenceVideo {
 
     public ConferenceVideo(String relayHost, int relayPort, String room, String user,
                            int width, int height, int fps, float quality, Listener listener) {
+        this(relayHost, relayPort, room, user, width, height, fps, quality, listener,
+                new ResourceFactory() {
+                    public DatagramSocket socket() throws Exception { return new DatagramSocket(); }
+                    public VideoCapture capture(int w, int h) { return new VideoCapture(w, h); }
+                });
+    }
+
+    ConferenceVideo(String relayHost, int relayPort, String room, String user,
+                    int width, int height, int fps, float quality, Listener listener,
+                    ResourceFactory resources) {
+        if (resources == null) throw new IllegalArgumentException("Conference media factory required");
+        this.resources = resources;
         this.relayHost = relayHost;
         this.relayPort = relayPort;
         this.room = room;
@@ -77,54 +99,87 @@ public class ConferenceVideo {
         this.listener = listener;
     }
 
-    public void start() throws Exception {
-        relayAddr = InetAddress.getByName(relayHost);
-        recvSocket = new DatagramSocket();
-        sendSocket = new DatagramSocket();
-
-        // 摄像头打不开时降级为“只收不发”，会议里仍能看到别人
+    public synchronized void start() throws Exception {
+        if (started || stopped) throw new IllegalStateException("Conference video cannot be restarted");
+        started = true;
         try {
-            capture = new VideoCapture(width, height);
-            capture.start();
-        } catch (Exception e) {
-            System.err.println("摄像头不可用（" + e.getMessage() + "），会议中将只收不发");
-            capture = null;
+            relayAddr = InetAddress.getByName(relayHost);
+            recvSocket = resources.socket();
+            sendSocket = resources.socket();
+
+            // Camera failure preserves receive-only mode, but releases partial camera acquisition.
+            try {
+                capture = resources.capture(width, height);
+                capture.start();
+            } catch (Exception cameraFailure) {
+                if (capture != null) {
+                    try { capture.stop(); } catch (RuntimeException ignored) { }
+                    capture = null;
+                }
+                System.err.println("Camera unavailable; conference video is receive-only");
+            }
+
+            running = true;
+            sendJoin();
+            receiveThread = new Thread(this::receiveLoop, "ConfVideoRecv");
+            sendThread = new Thread(this::sendLoop, "ConfVideoSend");
+            heartbeatThread = new Thread(this::heartbeatLoop, "ConfVideoBeat");
+            receiveThread.setDaemon(true);
+            sendThread.setDaemon(true);
+            heartbeatThread.setDaemon(true);
+            receiveThread.start();
+            sendThread.start();
+            heartbeatThread.start();
+            System.out.println("Conference video started: room " + room + ", UDP receive "
+                    + recvSocket.getLocalPort() + (capture != null ? "" : " (receive-only)"));
+        } catch (Exception | Error startupFailure) {
+            // This path also owns resources acquired before running became true.
+            stop();
+            throw startupFailure;
         }
-
-        running = true;
-        sendJoin();
-
-        Thread recv = new Thread(this::receiveLoop, "ConfVideoRecv");
-        recv.setDaemon(true);
-        recv.start();
-
-        Thread send = new Thread(this::sendLoop, "ConfVideoSend");
-        send.setDaemon(true);
-        send.start();
-
-        Thread beat = new Thread(this::heartbeatLoop, "ConfVideoBeat");
-        beat.setDaemon(true);
-        beat.start();
-
-        System.out.println("✓ 会议视频已启动：房间 " + room + "，中继 "
-                + relayHost + ":" + relayPort
-                + "，接收端口 " + recvSocket.getLocalPort()
-                + (capture != null ? "" : "（只收不发）"));
     }
 
     public void stop() {
-        if (!running) return;
-        running = false;
-        sendLeave();
-        closeQuietly(recvSocket);
-        closeQuietly(sendSocket);
-        if (capture != null) {
-            capture.stop();
+        final boolean notifyLeave;
+        final VideoCapture ownedCapture;
+        final Thread receive;
+        final Thread send;
+        final Thread heartbeat;
+        synchronized (this) {
+            if (stopped) return;
+            stopped = true;
+            notifyLeave = running;
+            running = false;
+            ownedCapture = capture;
             capture = null;
+            receive = receiveThread;
+            send = sendThread;
+            heartbeat = heartbeatThread;
         }
-        System.out.println("会议视频已停止（发送 " + framesSent + " 帧 / 接收 " + framesRecv + " 帧）");
+        try {
+            if (notifyLeave) sendLeave();
+        } finally {
+            closeQuietly(recvSocket);
+            closeQuietly(sendSocket);
+            if (receive != null) receive.interrupt();
+            if (send != null) send.interrupt();
+            if (heartbeat != null) heartbeat.interrupt();
+            if (ownedCapture != null) {
+                try { ownedCapture.stop(); } catch (RuntimeException ignored) { }
+            }
+            join(receive);
+            join(send);
+            join(heartbeat);
+            idToUser.clear();
+        }
+        System.out.println("Conference video stopped");
     }
 
+    private static void join(Thread thread) {
+        if (thread == null || thread == Thread.currentThread()) return;
+        try { thread.join(1000); }
+        catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
+    }
     // ---------------- 发送 ----------------
 
     private void sendLoop() {
@@ -132,10 +187,13 @@ public class ConferenceVideo {
         while (running) {
             long t0 = System.currentTimeMillis();
             try {
-                if (capture != null) {
-                    java.awt.image.BufferedImage img = capture.grab();
+                VideoCapture activeCapture = capture;
+                if (activeCapture != null) {
+                    java.awt.image.BufferedImage img = activeCapture.grab();
+                    if (!running) return;
                     if (img != null) {
                         byte[] jpeg = VideoCodec.encode(img, quality);
+                        if (!running) return;
                         byte[] head = frameHeader(TYPE_FRAME);
                         if (head.length + jpeg.length < 65000) {
                             byte[] out = new byte[head.length + jpeg.length];
@@ -144,7 +202,7 @@ public class ConferenceVideo {
                             send(out);
                             framesSent++;
                         }
-                        if (listener != null) listener.onLocalFrame(jpeg);
+                        if (running && listener != null) listener.onLocalFrame(jpeg);
                     }
                 } else {
                     Thread.sleep(interval);
@@ -217,6 +275,7 @@ public class ConferenceVideo {
             try {
                 DatagramPacket pkt = new DatagramPacket(buf, buf.length);
                 recvSocket.receive(pkt);
+                if (!running) return;
                 handlePacket(pkt.getData(), pkt.getLength());
             } catch (Exception e) {
                 if (!running) return;
@@ -235,7 +294,7 @@ public class ConferenceVideo {
             byte[] jpeg = new byte[len - 5];
             System.arraycopy(b, 5, jpeg, 0, jpeg.length);
             framesRecv++;
-            if (listener != null) listener.onRemoteFrame(name, jpeg);
+            if (running && listener != null) listener.onRemoteFrame(name, jpeg);
         } else if (type == TYPE_JOINED && len > 6) {
             int id = readInt(b, 1);
             int nameLen = b[5] & 0xFF;
@@ -245,7 +304,7 @@ public class ConferenceVideo {
         } else if (type == TYPE_LEFT && len >= 5) {
             int id = readInt(b, 1);
             String name = idToUser.remove(id);
-            if (name != null && listener != null) listener.onPeerLeft(name);
+            if (running && name != null && listener != null) listener.onPeerLeft(name);
         }
     }
 

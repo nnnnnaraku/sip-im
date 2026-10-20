@@ -2,67 +2,115 @@ package org.example;
 
 import javax.sound.sampled.*;
 
+/** Owns one microphone run at a time; a stopped worker never adopts a new line. */
 public class AudioCapture {
-    private TargetDataLine microphone;
-    private AudioFormat format;
-    private boolean isRunning = false;
-    private AudioCaptureListener listener;
+    interface LineFactory {
+        TargetDataLine create(AudioFormat format) throws LineUnavailableException;
+    }
+
+    private final AudioFormat format = new AudioFormat(8000.0f, 16, 1, true, false);
+    private final LineFactory lineFactory;
+    private Run current;
+
+    private static final class Run {
+        final TargetDataLine line;
+        final AudioCaptureListener listener;
+        volatile boolean active = true;
+        Thread worker;
+        private boolean lineClosed;
+
+        Run(TargetDataLine line, AudioCaptureListener listener) {
+            this.line = line;
+            this.listener = listener;
+        }
+
+        synchronized void close() {
+            if (lineClosed) return;
+            lineClosed = true;
+            closeLine(line);
+        }
+    }
 
     public interface AudioCaptureListener {
         void onAudioData(byte[] data, int length);
     }
 
     public AudioCapture() {
-        // 8kHz, 16bit, mono, signed, little-endian
-        format = new AudioFormat(8000.0f, 16, 1, true, false);
+        this(format -> (TargetDataLine) AudioSystem.getLine(
+                new DataLine.Info(TargetDataLine.class, format)));
     }
 
-    public void start(AudioCaptureListener listener) throws LineUnavailableException {
-        this.listener = listener;
+    /** Device-free test seam. A returned line is owned even if open/start fails. */
+    AudioCapture(LineFactory lineFactory) {
+        if (lineFactory == null) throw new IllegalArgumentException("Microphone factory required");
+        this.lineFactory = lineFactory;
+    }
 
-        DataLine.Info info = new DataLine.Info(TargetDataLine.class, format);
-
-        if (!AudioSystem.isLineSupported(info)) {
-            System.err.println("麦克风不支持该音频格式，尝试使用默认格式");
-            // 尝试默认格式
-            format = new AudioFormat(8000.0f, 16, 1, true, false);
-            info = new DataLine.Info(TargetDataLine.class, format);
+    public synchronized void start(AudioCaptureListener listener) throws LineUnavailableException {
+        if (current != null) throw new IllegalStateException("Microphone capture already started");
+        TargetDataLine opened = null;
+        try {
+            opened = lineFactory.create(format);
+            opened.open(format, 1600);
+            opened.start();
+            final Run run = new Run(opened, listener);
+            run.worker = new Thread(() -> capture(run), "AudioCapture");
+            run.worker.setDaemon(true);
+            current = run;
+            run.worker.start();
+        } catch (LineUnavailableException | RuntimeException | Error failure) {
+            current = null;
+            closeLine(opened);
+            throw failure;
         }
+        System.out.println("Microphone started: " + format);
+    }
 
-        microphone = (TargetDataLine) AudioSystem.getLine(info);
-        microphone.open(format, 1600); // 200ms buffer
-        microphone.start();
-
-        isRunning = true;
-
-        System.out.println("✓ 麦克风已启动");
-        System.out.println("  格式: " + format);
-
-        // 采集线程
-        new Thread(() -> {
-            byte[] buffer = new byte[320]; // 20ms @ 8kHz, 16bit = 160 samples * 2 bytes
-
-            while (isRunning) {
-                try {
-                    int bytesRead = microphone.read(buffer, 0, buffer.length);
-                    if (bytesRead > 0 && listener != null) {
-                        listener.onAudioData(buffer, bytesRead);
-                    }
-                } catch (Exception e) {
-                    if (isRunning) {
-                        System.err.println("音频采集错误: " + e.getMessage());
-                    }
+    private void capture(Run run) {
+        byte[] buffer = new byte[320]; // 20 ms: 160 signed PCM16 samples.
+        try {
+            while (run.active) {
+                int length = run.line.read(buffer, 0, buffer.length);
+                if (length > 0 && run.active && run.listener != null) {
+                    run.listener.onAudioData(buffer, length);
                 }
             }
-        }, "AudioCapture").start();
+        } catch (RuntimeException failure) {
+            if (run.active) System.err.println("Microphone capture stopped after a device error");
+        } finally {
+            run.active = false;
+            run.close();
+            synchronized (this) {
+                if (current == run) current = null;
+            }
+        }
     }
 
     public void stop() {
-        isRunning = false;
-        if (microphone != null) {
-            microphone.stop();
-            microphone.close();
+        final Run run;
+        synchronized (this) {
+            run = current;
+            if (run == null) return;
+            run.active = false;
         }
-        System.out.println("麦克风已停止");
+        run.close(); // Closing releases a driver-blocked read before joining.
+        join(run.worker);
+        synchronized (this) {
+            if (current == run && !run.worker.isAlive()) current = null;
+        }
+        System.out.println("Microphone stopped");
+    }
+
+    private static void closeLine(TargetDataLine line) {
+        if (line == null) return;
+        try { line.stop(); } catch (RuntimeException ignored) { }
+        try { line.flush(); } catch (RuntimeException ignored) { }
+        try { line.close(); } catch (RuntimeException ignored) { }
+    }
+
+    private static void join(Thread thread) {
+        if (thread == null || thread == Thread.currentThread()) return;
+        try { thread.join(1000); }
+        catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
     }
 }

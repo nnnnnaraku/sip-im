@@ -3,143 +3,164 @@ package org.example;
 import javax.sound.sampled.*;
 import java.net.*;
 
+/** Owns its socket and playback device for exactly one receiver lifetime. */
 public class RTPAudioReceiver {
-    private DatagramSocket socket;
-    private SourceDataLine speaker;
-    private boolean isRunning = false;
-    private AudioFormat format;
-    /** 已收到的 RTP 包数（用于判断音频是否真的在接收） */
-    private volatile long packetsReceived = 0;
-    /** 收到音频的平均电平（0~32767），用于判断收到的到底是有声音还是静音 */
-    private volatile int recvLevel = 0;
+    interface SpeakerFactory {
+        SourceDataLine create(AudioFormat format) throws LineUnavailableException;
+    }
+    interface SocketFactory {
+        DatagramSocket create(int port) throws SocketException;
+    }
+
+    private final DatagramSocket socket;
+    private final SourceDataLine speaker;
+    private volatile boolean isRunning;
+    private boolean stopped;
+    private Thread worker;
+    private final Object speakerCloseLock = new Object();
+    private boolean speakerClosed;
+    private volatile long packetsReceived;
+    private volatile int recvLevel;
 
     public RTPAudioReceiver(int localPort) throws Exception {
-        socket = new DatagramSocket(localPort);
-        socket.setSoTimeout(5000); // 5秒超时
-
-        // 16bit PCM 8kHz mono
-        format = new AudioFormat(8000.0f, 16, 1, true, false);
-
-        DataLine.Info info = new DataLine.Info(SourceDataLine.class, format);
-        speaker = (SourceDataLine) AudioSystem.getLine(info);
-        speaker.open(format, 3200); // 400ms buffer
-        speaker.start();
-
-        System.out.println("✓ RTP接收器已启动，监听端口: " + localPort);
-        System.out.println("  格式: " + format);
+        this(localPort, format -> (SourceDataLine) AudioSystem.getLine(
+                new DataLine.Info(SourceDataLine.class, format)), DatagramSocket::new);
     }
 
-    /** 供 RTPAudioSender 复用，实现 RTP 收发共用一个本地端口 */
-    public DatagramSocket getSocket() {
-        return socket;
+    /** Device/socket factories allow rollback testing without audio hardware. */
+    RTPAudioReceiver(int localPort, SpeakerFactory speakers, SocketFactory sockets) throws Exception {
+        if (speakers == null || sockets == null) throw new IllegalArgumentException("Media factories required");
+        DatagramSocket allocatedSocket = sockets.create(localPort);
+        SourceDataLine allocatedSpeaker = null;
+        try {
+            allocatedSocket.setSoTimeout(5000);
+            AudioFormat format = new AudioFormat(8000.0f, 16, 1, true, false);
+            allocatedSpeaker = speakers.create(format);
+            allocatedSpeaker.open(format, 3200);
+            allocatedSpeaker.start();
+        } catch (Exception | Error failure) {
+            allocatedSocket.close();
+            closeSpeaker(allocatedSpeaker);
+            throw failure;
+        }
+        socket = allocatedSocket;
+        speaker = allocatedSpeaker;
+        System.out.println("RTP receiver ready: UDP " + socket.getLocalPort());
     }
 
-    /** 已收到的 RTP 包数 */
-    public long getPacketsReceived() {
-        return packetsReceived;
-    }
+    /** Sender reuses the receiver-owned socket for symmetric RTP. */
+    public DatagramSocket getSocket() { return socket; }
+    public long getPacketsReceived() { return packetsReceived; }
+    public int getRecvLevel() { return recvLevel; }
 
-    /** 收到音频的当前平均电平（对端说话时明显上升，静音时接近 0） */
-    public int getRecvLevel() {
-        return recvLevel;
-    }
-
-    public void start() {
+    public synchronized void start() {
+        if (stopped) throw new IllegalStateException("RTP receiver has stopped");
+        if (isRunning) return;
+        if (worker != null) throw new IllegalStateException("RTP receiver cannot restart an old worker");
         isRunning = true;
+        worker = new Thread(this::receiveLoop, "RTPReceiver");
+        worker.setDaemon(true);
+        try { worker.start(); }
+        catch (RuntimeException | Error failure) {
+            isRunning = false;
+            stopped = true;
+            socket.close();
+            closeOwnedSpeaker();
+            throw failure;
+        }
+    }
 
-        new Thread(() -> {
-            byte[] buffer = new byte[512];
-            int consecutiveErrors = 0;
-
+    private void receiveLoop() {
+        byte[] buffer = new byte[512];
+        int consecutiveErrors = 0;
+        try {
             while (isRunning) {
                 try {
                     DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
                     socket.receive(packet);
+                    if (!isRunning) break;
+                    consecutiveErrors = 0;
 
-                    consecutiveErrors = 0; // 重置错误计数
-
-                    // 解析RTP包
                     byte[] rtpData = packet.getData();
                     int packetLength = packet.getLength();
-
-                    if (packetLength < 12) {
-                        continue; // RTP头至少12字节
-                    }
+                    if (packetLength < 12) continue;
 
                     packetsReceived++;
                     if (packetsReceived == 1) {
-                        System.out.println("✓ 收到第一个 RTP 包，来自 "
-                                + packet.getAddress().getHostAddress() + ":" + packet.getPort()
-                                + "，长度 " + packetLength + " 字节");
+                        System.out.println("First RTP packet received: " + packetLength + " bytes");
                     }
 
-                    // RTP头长度
                     int rtpHeaderLength = 12;
-
-                    // 检查是否有扩展头
-                    int cc = rtpData[0] & 0x0F; // CSRC count
+                    int cc = rtpData[0] & 0x0F;
                     rtpHeaderLength += cc * 4;
-
-                    if ((rtpData[0] & 0x10) != 0) { // 有扩展头
+                    if ((rtpData[0] & 0x10) != 0) {
                         if (packetLength < rtpHeaderLength + 4) continue;
-                        int extLen = ((rtpData[rtpHeaderLength + 2] & 0xFF) << 8) |
-                                (rtpData[rtpHeaderLength + 3] & 0xFF);
+                        int extLen = ((rtpData[rtpHeaderLength + 2] & 0xFF) << 8)
+                                | (rtpData[rtpHeaderLength + 3] & 0xFF);
                         rtpHeaderLength += 4 + extLen * 4;
                     }
+                    if (packetLength <= rtpHeaderLength) continue;
 
-                    if (packetLength <= rtpHeaderLength) {
-                        continue;
-                    }
-
-                    // 提取音频数据 (PCMU格式)
+                    // Existing baseline PCMU behavior; negotiated codec changes belong to audio P0.
                     int payloadLength = packetLength - rtpHeaderLength;
                     byte[] mulawData = new byte[payloadLength];
                     System.arraycopy(rtpData, rtpHeaderLength, mulawData, 0, payloadLength);
-
-                    // 解码 PCMU 为 PCM
                     byte[] pcmData = PCMUEncoder.decode(mulawData);
-
-                    // 统计收到音频的电平（有声音时有明显数值，静音时接近 0）
                     int sum = 0;
                     int n = pcmData.length / 2;
                     for (int i = 0; i < n; i++) {
-                        int s = (short) ((pcmData[2 * i + 1] << 8) | (pcmData[2 * i] & 0xFF));
-                        sum += Math.abs(s);
+                        int sample = (short) ((pcmData[2 * i + 1] << 8) | (pcmData[2 * i] & 0xFF));
+                        sum += Math.abs(sample);
                     }
-                    int avg = (n > 0) ? (sum / n) : 0;
-                    recvLevel = (int) (recvLevel * 0.85 + avg * 0.15);
-
-                    // 播放音频
-                    speaker.write(pcmData, 0, pcmData.length);
-
-                } catch (SocketTimeoutException e) {
-                    // 超时是正常的，继续等待
-                } catch (Exception e) {
+                    int average = n > 0 ? sum / n : 0;
+                    recvLevel = (int) (recvLevel * 0.85 + average * 0.15);
+                    if (isRunning) speaker.write(pcmData, 0, pcmData.length);
+                } catch (SocketTimeoutException timeout) {
+                    // A quiet session is not an error.
+                } catch (Exception failure) {
                     if (isRunning) {
                         consecutiveErrors++;
-                        if (consecutiveErrors < 5) {
-                            System.err.println("RTP接收错误: " + e.getMessage());
-                        }
-                        if (consecutiveErrors >= 10) {
-                            System.err.println("连续错误过多，停止接收");
-                            break;
-                        }
+                        if (consecutiveErrors < 5) System.err.println("RTP playback/receive error");
+                        if (consecutiveErrors >= 10 || socket.isClosed()) break;
                     }
                 }
             }
-        }, "RTPReceiver").start();
+        } finally {
+            isRunning = false;
+            socket.close();
+            closeOwnedSpeaker();
+            synchronized (this) { stopped = true; }
+        }
     }
 
+    /** Close first, never drain: stale devices must not delay the next call. */
     public void stop() {
-        isRunning = false;
-        if (speaker != null) {
-            speaker.drain();
-            speaker.stop();
-            speaker.close();
+        final Thread receiving;
+        synchronized (this) {
+            stopped = true;
+            isRunning = false;
+            receiving = worker;
         }
-        if (socket != null && !socket.isClosed()) {
-            socket.close();
+        socket.close(); // Unblocks receive even if no RTP was ever received.
+        closeOwnedSpeaker();
+        if (receiving != null && receiving != Thread.currentThread()) {
+            try { receiving.join(1000); }
+            catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
         }
-        System.out.println("RTP接收器已停止");
+    }
+
+    private void closeOwnedSpeaker() {
+        synchronized (speakerCloseLock) {
+            if (speakerClosed) return;
+            speakerClosed = true;
+            closeSpeaker(speaker);
+        }
+    }
+
+    private static void closeSpeaker(SourceDataLine line) {
+        if (line == null) return;
+        try { line.stop(); } catch (RuntimeException ignored) { }
+        try { line.flush(); } catch (RuntimeException ignored) { }
+        try { line.close(); } catch (RuntimeException ignored) { }
     }
 }
