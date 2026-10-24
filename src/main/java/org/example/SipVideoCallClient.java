@@ -207,6 +207,8 @@ public class SipVideoCallClient implements SipListener {
     private AudioCapture audioCapture;
     private RTPAudioSender rtpSender;
     private RTPAudioReceiver rtpReceiver;
+    /** The accepted SDP mapping is also the only mapping allowed by the RTP receiver. */
+    private AudioSdp.NegotiatedAudio negotiatedAudio;
 
     private int localAudioPort = intCfg("media.local.port", 8000);
     private String remoteAudioIp;
@@ -652,58 +654,72 @@ public class SipVideoCallClient implements SipListener {
     }
 
     // 启动媒体流
-    private void startMedia(String remoteSdp) {
-        if (rtpReceiver != null) {
-            // 已经在通话中：拨会议室时服务器还会回呼本机并再带一份 SDP，
-            // 若重复建流会二次绑定同一端口（BindException）。此处直接忽略。
-            System.out.println("媒体流已在运行，忽略重复的启动请求");
-            return;
+    protected synchronized boolean startMedia(String remoteSdp, AudioSdp.NegotiatedAudio audio) {
+        Objects.requireNonNull(audio, "negotiated audio");
+        if (rtpReceiver != null && audio.equals(negotiatedAudio)) {
+            // A conference callback/retransmission must not bind the same port twice.
+            System.out.println("音频协商未变化，保留现有媒体流: " + audio);
+            return true;
         }
         try {
-            // 解析对方的SDP，获取IP和端口
-            parseRemoteSDP(remoteSdp);
+            // A valid new SDP may change codec or endpoint. Replace only audio,
+            // preserving the existing conference/video lifecycle.
+            if (rtpReceiver != null) stopAudioMedia();
+            parseRemoteSDP(remoteSdp, audio);
             System.out.println("\n=== 启动音频流 ===");
             System.out.println("本地音频端口: " + localAudioPort);
             System.out.println("远程音频地址: " + remoteAudioIp + ":" + remoteAudioPort);
+            System.out.println("协商音频: " + audio.getCodec().getRtpName()
+                    + "/8000, PT=" + audio.getPayloadType());
 
             // 启动RTP接收器（绑定 localAudioPort，该端口已在上述 SDP 中宣告）
-            rtpReceiver = new RTPAudioReceiver(localAudioPort);
+            rtpReceiver = new RTPAudioReceiver(localAudioPort, audio.getReceiveCodecs());
             rtpReceiver.start();
 
             // 启动RTP发送器：复用接收器的同一个 socket，保证「收发同端口」。
             // 若用独立端口发送，对端做对称 RTP 校验时会丢弃数据包，导致单向/无音频。
-            rtpSender = new RTPAudioSender(rtpReceiver.getSocket());
+            rtpSender = new RTPAudioSender(rtpReceiver.getSocket(), audio.getCodec(), audio.getPayloadType());
             rtpSender.setRemote(remoteAudioIp, remoteAudioPort);
+            final RTPAudioSender sender = rtpSender;
 
             // 启动音频采集
             audioCapture = new AudioCapture();
             audioCapture.start((data, length) -> {
                 // 将采集的音频通过RTP发送
-                rtpSender.sendAudio(data, length);
+                sender.sendAudio(data, length);
             });
 
+            negotiatedAudio = audio;
             System.out.println("✓ 音频流已启动，可以开始通话！");
-            startLevelMonitor();
-            if (conferenceRoom != null) startConferenceVideo();
-            else startVideo();
+            if (!levelMonitorRunning) startLevelMonitor();
+            if (conferenceRoom != null) {
+                if (confVideo == null) startConferenceVideo();
+            } else if (!videoRunning) startVideo();
+            return true;
 
         } catch (Exception e) {
             System.err.println("启动媒体流失败: " + e.getMessage());
             e.printStackTrace();
+            levelMonitorRunning = false;
+            stopAudioMedia();
+            return false;
         }
     }
 
     /** 构造本机 SDP（音频 + 可选视频），主叫和被叫共用 */
     private String buildLocalSdp() {
+        return buildLocalSdp(null);
+    }
+
+    /** Offers advertise implemented codecs; answers contain only the accepted intersection. */
+    private String buildLocalSdp(AudioSdp.NegotiatedAudio audio) {
         return "v=0\r\n" +
                 "o=" + username + " 123456 654321 IN IP4 " + localIp + "\r\n" +
                 "s=Audio/Video Call\r\n" +
                 "c=IN IP4 " + localIp + "\r\n" +
                 "t=0 0\r\n" +
-                "m=audio " + localAudioPort + " RTP/AVP 0 8 101\r\n" +
-                "a=rtpmap:0 PCMU/8000\r\n" +
-                "a=rtpmap:8 PCMA/8000\r\n" +
-                "a=rtpmap:101 telephone-event/8000\r\n" +
+                (audio == null ? AudioSdp.offerMedia(localAudioPort)
+                        : AudioSdp.answerMedia(localAudioPort, audio)) +
                 (videoCall ? videoSdpLine() : "");
     }
 
@@ -895,24 +911,18 @@ public class SipVideoCallClient implements SipListener {
         t.start();
     }
 
-    // 解析SDP获取远程媒体信息
-    private void parseRemoteSDP(String sdp) {
+    // Audio has passed negotiation before any device is opened.
+    private void parseRemoteSDP(String sdp, AudioSdp.NegotiatedAudio audio) {
         System.out.println("\n收到的SDP:");
         System.out.println(sdp);
 
-        // 解析 c= 行获取IP
+        remoteAudioIp = audio.getRemoteAddress();
+        remoteAudioPort = audio.getRemotePort();
+        // Keep the existing video connection handling independent of audio's
+        // media-level c= override; video negotiation is outside this repair.
         Pattern cPattern = Pattern.compile("c=IN IP4 ([\\d.]+)");
         Matcher cMatcher = cPattern.matcher(sdp);
-        if (cMatcher.find()) {
-            remoteAudioIp = cMatcher.group(1);
-        }
-
-        // 解析 m=audio 行获取端口
-        Pattern mPattern = Pattern.compile("m=audio (\\d+)");
-        Matcher mMatcher = mPattern.matcher(sdp);
-        if (mMatcher.find()) {
-            remoteAudioPort = Integer.parseInt(mMatcher.group(1));
-        }
+        String videoAddress = cMatcher.find() ? cMatcher.group(1) : remoteAudioIp;
 
         // 解析 m=video 行获取端口（对端可能不支持视频）
         remoteVideoPort = 0;
@@ -920,7 +930,7 @@ public class SipVideoCallClient implements SipListener {
         Matcher vMatcher = vPattern.matcher(sdp);
         if (vMatcher.find()) {
             remoteVideoPort = Integer.parseInt(vMatcher.group(1));
-            remoteVideoIp = remoteAudioIp;   // 同一 SDP 里的 c= 行对音视频通用
+            remoteVideoIp = videoAddress;
         }
 
         System.out.println("解析结果 - IP: " + remoteAudioIp
@@ -961,6 +971,11 @@ public class SipVideoCallClient implements SipListener {
             System.out.println("  OK 双向都有音频包，媒体通道正常");
         }
 
+        stopAudioMedia();
+    }
+
+    /** Also releases sockets/devices after partial audio initialization. */
+    private void stopAudioMedia() {
         if (audioCapture != null) {
             audioCapture.stop();
             audioCapture = null;
@@ -974,6 +989,7 @@ public class SipVideoCallClient implements SipListener {
             rtpReceiver = null;
         }
 
+        negotiatedAudio = null;
         System.out.println("音频流已停止");
     }
 
@@ -1465,6 +1481,17 @@ public class SipVideoCallClient implements SipListener {
 
         tx.sendResponse(messageFactory.createResponse(Response.TRYING, request));
 
+        byte[] offer = request.getRawContent();
+        String remoteSdp = offer == null ? "" : new String(offer, StandardCharsets.UTF_8);
+        final AudioSdp.NegotiatedAudio audio;
+        try {
+            audio = AudioSdp.negotiateOffer(remoteSdp);
+        } catch (IllegalArgumentException e) {
+            System.err.println("拒绝来电：音频协商失败: " + e.getMessage());
+            tx.sendResponse(messageFactory.createResponse(Response.NOT_ACCEPTABLE_HERE, request));
+            return;
+        }
+
         FromHeader from = (FromHeader) request.getHeader(FromHeader.NAME);
         System.out.println("\n[来电] 来自 " + ((from != null) ? from.getAddress() : "未知")
                 + "，自动接听...");
@@ -1480,18 +1507,28 @@ public class SipVideoCallClient implements SipListener {
         tx.sendResponse(ringing);
 
         // 先看主叫 SDP 里有没有 m=video，决定本次是否带视频
-        byte[] offer = request.getRawContent();
-        String remoteSdp = (offer == null) ? "" : new String(offer, StandardCharsets.UTF_8);
         videoCall = VIDEO_ENABLED && remoteSdp.contains("m=video");
 
         // 200 OK + 本机 SDP
         Response ok = messageFactory.createResponse(Response.OK, request);
         ok.addHeader(headerFactory.createContactHeader(contactAddress));
         ContentTypeHeader ct = headerFactory.createContentTypeHeader("application", "sdp");
-        String localSdp = buildLocalSdp();
+        String localSdp = buildLocalSdp(audio);
         System.out.println("\n发出的SDP:\n" + localSdp);
         ok.setContent(localSdp.getBytes(StandardCharsets.UTF_8), ct);
-        tx.sendResponse(ok);
+        // Verify local audio startup before accepting the call. A device failure
+        // can still be rejected here instead of sending BYE before the UAS gets ACK.
+        if (!startMedia(remoteSdp, audio)) {
+            System.err.println("拒绝来电：协商后的本地音频设备不可用");
+            tx.sendResponse(messageFactory.createResponse(Response.TEMPORARILY_UNAVAILABLE, request));
+            return;
+        }
+        try {
+            tx.sendResponse(ok);
+        } catch (Exception e) {
+            stopMedia();
+            throw e;
+        }
 
         if (dialog == null) {
             dialog = tx.getDialog();
@@ -1499,23 +1536,32 @@ public class SipVideoCallClient implements SipListener {
         System.out.println("✓ 已接听，通话建立成功!");
         markCallStart("IN", peerOf(from));
         notifyCall("active", peerOf(from));
+        scheduleAutoHangup("AutoHangupCallee");
+    }
 
-        // 对端 SDP -> 建立媒体（音频 + 视频）
-        byte[] raw = request.getRawContent();
-        if (raw != null && raw.length > 0) {
-            startMedia(new String(raw, StandardCharsets.UTF_8));
-        }
-
-        // 达到设定通话时长后自动挂断
+    /** Existing timeout behavior, separated so SIP tests never start background calls. */
+    protected void scheduleAutoHangup(String threadName) {
         new Thread(() -> {
             try {
                 Thread.sleep(CALL_DURATION_SEC * 1000L);
                 System.out.println("\n通话达到 " + CALL_DURATION_SEC + " 秒，自动挂断...");
                 hangup();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
             } catch (Exception e) {
-                // 对方提前挂断时会走到这里，属正常
+                System.err.println("自动挂断失败: " + e.getMessage());
             }
-        }, "AutoHangupCallee").start();
+        }, threadName).start();
+    }
+
+    private void endFailedAudioCall(String reason) {
+        System.err.println("音频协商/启动失败，结束呼叫: " + reason);
+        try {
+            hangup();
+        } catch (Exception e) {
+            System.err.println("发送 BYE 失败: " + e.getMessage());
+            stopMedia();
+        }
     }
 
     @Override
@@ -1544,31 +1590,30 @@ public class SipVideoCallClient implements SipListener {
                     System.out.println("对方振铃中...");
                     notifyCall("ringing", targetUser);
                 } else if (statusCode == Response.OK) {
-                    System.out.println("✓ 对方接听! 通话建立成功!");
-                    notifyCall("active", targetUser);
-
                     if (dialog == null && clientTransaction != null) {
                         dialog = clientTransaction.getDialog();
                     }
+                    if (dialog == null) dialog = responseEvent.getDialog();
 
+                    // A 2xx must be ACKed even when its SDP cannot be accepted.
                     sendAck(response);
 
-                    // 启动音频流
-                    if (response.getContent() != null) {
-                        String remoteSdp = new String((byte[]) response.getContent());
-                        startMedia(remoteSdp);
+                    byte[] raw = response.getRawContent();
+                    String remoteSdp = raw == null ? "" : new String(raw, StandardCharsets.UTF_8);
+                    final AudioSdp.NegotiatedAudio audio;
+                    try {
+                        audio = AudioSdp.negotiateAnswer(remoteSdp);
+                    } catch (IllegalArgumentException e) {
+                        endFailedAudioCall(e.getMessage());
+                        return;
                     }
-
-                    // 达到设定通话时长后自动挂断
-                    new Thread(() -> {
-                        try {
-                            Thread.sleep(CALL_DURATION_SEC * 1000L);
-                            System.out.println("\n通话达到 " + CALL_DURATION_SEC + " 秒，自动挂断...");
-                            hangup();
-                        } catch (Exception e) {
-                            e.printStackTrace();
-                        }
-                    }).start();
+                    if (!startMedia(remoteSdp, audio)) {
+                        endFailedAudioCall("无法启动协商后的音频设备");
+                        return;
+                    }
+                    System.out.println("✓ 对方接听，协商音频已启动!");
+                    notifyCall("active", targetUser);
+                    scheduleAutoHangup("AutoHangupCaller");
 
                 } else if (statusCode == Response.UNAUTHORIZED || statusCode == Response.PROXY_AUTHENTICATION_REQUIRED) {
                     System.out.println("INVITE需要认证，重新发送");
