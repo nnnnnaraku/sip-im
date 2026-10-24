@@ -207,7 +207,11 @@
   }
   if (typeof module !== "undefined" && module.exports) module.exports = { createGroupChat: createGroupChat };
   if (root && root.document) {
-    root.GroupChat = createGroupChat({ document: root.document, fetch: root.fetch.bind(root), confirm: root.confirm.bind(root) });
+    // 必须复用 WebAccess 的 fetch：它会带上 X-SIP-CSRF，否则所有群操作会被拒绝（CSRF_REQUIRED）。
+    var groupFetch = (root.WebAccess && typeof root.WebAccess.fetch === "function")
+      ? root.WebAccess.fetch.bind(root.WebAccess)
+      : root.fetch.bind(root);
+    root.GroupChat = createGroupChat({ document: root.document, fetch: groupFetch, confirm: root.confirm.bind(root) });
     root.GroupChat.load();
     root.setInterval(function () { root.GroupChat.load(); }, 5000);
   }
