@@ -22,6 +22,7 @@ import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.nio.file.attribute.UserPrincipal;
 import java.security.SecureRandom;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Collections;
@@ -120,6 +121,7 @@ public final class PrivateWebToken {
         options.add(StandardOpenOption.WRITE);
         options.add(LinkOption.NOFOLLOW_LINKS);
         try (SeekableByteChannel out = Files.newByteChannel(file, options, permissions)) {
+            restrictAcl(file);
             BasicFileAttributes initial = inspect(file, 128);
             try (FileIdentity identity = FileIdentity.capture(file, initial)) {
                 ByteBuffer data = ByteBuffer.wrap(bytes);
@@ -131,6 +133,25 @@ public final class PrivateWebToken {
             // Another process won CREATE_NEW. Never replace it; the caller verifies and reads it.
         } catch (UnsupportedOperationException e) {
             throw new IOException("File system cannot atomically create private files");
+        }
+    }
+
+    /**
+     * Windows 会在新建文件时继承父目录的 ACE（常含 Users / Authenticated Users），
+     * 必须在写入前替换为仅 owner 的 ACL，否则后续校验会判定为泄露。
+     */
+    private static void restrictAcl(Path file) throws IOException {
+        AclFileAttributeView view = Files.getFileAttributeView(file, AclFileAttributeView.class, LinkOption.NOFOLLOW_LINKS);
+        if (view == null) return;
+        UserPrincipal owner = view.getOwner();
+        if (owner == null) throw new IOException("Private file owner is unavailable");
+        List<AclEntry> entries = new ArrayList<>();
+        entries.add(AclEntry.newBuilder().setType(AclEntryType.ALLOW).setPrincipal(owner)
+                .setPermissions(EnumSet.allOf(AclEntryPermission.class)).build());
+        try {
+            view.setAcl(entries);
+        } catch (IOException | UnsupportedOperationException e) {
+            throw new IOException("File system cannot enforce private file permissions", e);
         }
     }
 
