@@ -127,6 +127,7 @@ public class RTPAudioReceiver {
         // Avoid silent truncation when packets include long extensions or padding.
         byte[] buffer = new byte[65535];
         while (running) {
+            reportSources();
             try {
                 DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
                 socket.receive(packet);
@@ -275,9 +276,9 @@ public class RTPAudioReceiver {
         }
     }
 
-    /** 前 60 秒打印每个来源的包数，用于判断对端音频是否真的到达。 */
+    /** 前 120 秒每 10 秒打印一次来源统计，用于判断对端音频是否真的到达。 */
     private void reportSources() {
-        if (sources.isEmpty() || sourceReports >= 6) return;
+        if (sources.isEmpty() || sourceReports >= 12) return;
         long now = System.currentTimeMillis();
         if (lastSourceReport != 0 && now - lastSourceReport < 10000) return;
         lastSourceReport = now;
