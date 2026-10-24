@@ -32,12 +32,19 @@ public class ConferenceVideo {
         void onPeerLeft(String user);
     }
 
+    /** 会议音频回调：音频帧与视频共用同一条中继连接与接收端口。 */
+    public interface AudioSink {
+        void onAudioFrame(int senderId, int seq, byte[] pcm);
+    }
+
     private static final int TYPE_JOIN = 1;
     private static final int TYPE_FRAME = 2;
     private static final int TYPE_LEAVE = 3;
     private static final int TYPE_FRAME_IN = 4;
     private static final int TYPE_JOINED = 5;
     private static final int TYPE_LEFT = 6;
+    private static final int TYPE_AUDIO = 7;
+    private static final int TYPE_AUDIO_IN = 8;
 
     private final String relayHost;
     private final int relayPort;
@@ -60,6 +67,11 @@ public class ConferenceVideo {
     /** 统计：便于排障（不依赖界面） */
     private volatile long framesSent = 0;
     private volatile long framesRecv = 0;
+    private volatile long audioSent = 0;
+    private volatile long audioRecv = 0;
+
+    /** 会议音频回调（由 ConferenceAudio 注册） */
+    private volatile AudioSink audioSink;
 
     /** 中继下发的 id -> 用户名 */
     private final Map<Integer, String> idToUser = new ConcurrentHashMap<>();
@@ -75,6 +87,35 @@ public class ConferenceVideo {
         this.fps = fps;
         this.quality = quality;
         this.listener = listener;
+    }
+
+    /** 注册会议音频回调（在 start 之后由 ConferenceAudio 调用）。 */
+    public void setAudioSink(AudioSink sink) {
+        this.audioSink = sink;
+    }
+
+    public String getRoom() {
+        return room;
+    }
+
+    /**
+     * 发送一帧会议音频。音频与视频共用同一条已 JOIN 的连接和接收端口，
+     * 避免中继把同一个用户当成两个成员、互相覆盖接收地址。
+     *
+     * @param pcm 20ms 的 16bit 小端 PCM（320 字节）
+     * @param seq 16 位序号，接收端用它做抖动缓冲与丢包对齐
+     */
+    public boolean sendAudio(byte[] pcm, int seq) {
+        if (!running || pcm == null || pcm.length == 0) return false;
+        byte[] head = frameHeader(TYPE_AUDIO);
+        byte[] out = new byte[head.length + 2 + pcm.length];
+        System.arraycopy(head, 0, out, 0, head.length);
+        out[head.length] = (byte) (seq >>> 8);
+        out[head.length + 1] = (byte) seq;
+        System.arraycopy(pcm, 0, out, head.length + 2, pcm.length);
+        send(out);
+        audioSent++;
+        return true;
     }
 
     public void start() throws Exception {
@@ -115,6 +156,7 @@ public class ConferenceVideo {
     public void stop() {
         if (!running) return;
         running = false;
+        audioSink = null;
         sendLeave();
         closeQuietly(recvSocket);
         closeQuietly(sendSocket);
@@ -122,7 +164,8 @@ public class ConferenceVideo {
             capture.stop();
             capture = null;
         }
-        System.out.println("会议视频已停止（发送 " + framesSent + " 帧 / 接收 " + framesRecv + " 帧）");
+        System.out.println("会议视频已停止（视频 发送 " + framesSent + " / 接收 " + framesRecv
+                + "，音频 发送 " + audioSent + " / 接收 " + audioRecv + "）");
     }
 
     // ---------------- 发送 ----------------
@@ -246,6 +289,14 @@ public class ConferenceVideo {
             int id = readInt(b, 1);
             String name = idToUser.remove(id);
             if (name != null && listener != null) listener.onPeerLeft(name);
+        } else if (type == TYPE_AUDIO_IN && len > 7) {
+            int id = readInt(b, 1);
+            int seq = ((b[5] & 0xFF) << 8) | (b[6] & 0xFF);
+            byte[] pcm = new byte[len - 7];
+            System.arraycopy(b, 7, pcm, 0, pcm.length);
+            audioRecv++;
+            AudioSink sink = audioSink;
+            if (sink != null) sink.onAudioFrame(id, seq, pcm);
         }
     }
 

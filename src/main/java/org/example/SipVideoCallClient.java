@@ -8,6 +8,7 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
@@ -215,11 +216,15 @@ public class SipVideoCallClient implements SipListener {
     /** 本次通话是否带视频（false = 纯语音通话） */
     private volatile boolean videoCall = false;
 
-    /** 会议视频（拨 *6*N 时启用；音频仍由 SIP 会议室混音） */
+    /** 会议视频（拨 *6*N 时启用；音频走应用层中继，不再依赖会议室混音） */
     private volatile ConferenceVideo confVideo;
+    /** 会议音频（与视频共用中继连接，混音播放且不回传自己） */
+    private volatile ConferenceAudio confAudio;
+    /** 会议模式下绑定本地媒体端口并丢弃会议室混音，避免服务器回 ICMP 不可达 */
+    private DatagramSocket conferenceAudioSink;
     /** 当前会议房间号（*6*1 中的 1）；非会议通话为 null */
     private volatile String conferenceRoom;
-    /** 会议视频中继地址（默认就是 SIP 服务器那台机） */
+    /** 会议媒体中继地址（默认就是 SIP 服务器那台机） */
     private static final String VIDEO_RELAY_HOST = cfg("video.relay.host", cfg("sip.server.ip", "127.0.0.1"));
     private static final int VIDEO_RELAY_PORT = intCfg("video.relay.port", 9100);
 
@@ -679,8 +684,8 @@ public class SipVideoCallClient implements SipListener {
     // 启动媒体流
     protected synchronized boolean startMedia(String remoteSdp, AudioSdp.NegotiatedAudio audio) {
         Objects.requireNonNull(audio, "negotiated audio");
-        if (rtpReceiver != null && audio.equals(negotiatedAudio)) {
-            // A conference callback/retransmission must not bind the same port twice.
+        if (audio.equals(negotiatedAudio) && (rtpReceiver != null || confAudio != null)) {
+            // 会议室回呼/重传会再次带 SDP：媒体已在运行，不能重复绑定端口或重复采集。
             System.out.println("音频协商未变化，保留现有媒体流: " + audio);
             return true;
         }
@@ -694,6 +699,19 @@ public class SipVideoCallClient implements SipListener {
             System.out.println("远程音频地址: " + remoteAudioIp + ":" + remoteAudioPort);
             System.out.println("协商音频: " + audio.getCodec().getRtpName()
                     + "/8000, PT=" + audio.getPayloadType());
+
+            negotiatedAudio = audio;
+
+            if (conferenceRoom != null) {
+                // 会议模式：不再向 miniSIPServer 会议室收发音频。
+                // 会议室混音会把发言者自己的声音回传，形成自听回声；改为应用层中继扇出。
+                // 这里仍绑定 SDP 声明的本地端口并丢弃混音，避免服务器收到 ICMP 不可达。
+                openConferenceAudioSink();
+                System.out.println("✓ 会议模式：音频改走应用层中继（不回传自己）");
+                if (confVideo == null) startConferenceVideo();
+                if (confAudio == null) startConferenceAudio();
+                return true;
+            }
 
             // 启动RTP接收器（绑定 localAudioPort，该端口已在上述 SDP 中宣告）
             rtpReceiver = new RTPAudioReceiver(localAudioPort, audio.getReceiveCodecs());
@@ -712,18 +730,16 @@ public class SipVideoCallClient implements SipListener {
                 sender.sendAudio(data, length);
             });
 
-            negotiatedAudio = audio;
             System.out.println("✓ 音频流已启动，可以开始通话！");
             if (!levelMonitorRunning) startLevelMonitor();
-            if (conferenceRoom != null) {
-                if (confVideo == null) startConferenceVideo();
-            } else if (!videoRunning) startVideo();
+            if (!videoRunning) startVideo();
             return true;
 
         } catch (Exception e) {
             System.err.println("启动媒体流失败: " + e.getMessage());
             e.printStackTrace();
             levelMonitorRunning = false;
+            stopConferenceAudio();
             stopAudioMedia();
             return false;
         }
@@ -866,9 +882,58 @@ public class SipVideoCallClient implements SipListener {
         System.out.println("视频流已停止");
     }
 
+    /** 会议模式：绑定 SDP 声明的本地音频端口，丢弃服务器会议室混音。 */
+    private void openConferenceAudioSink() {
+        if (conferenceAudioSink != null) return;
+        try {
+            final DatagramSocket sink = new DatagramSocket(localAudioPort);
+            conferenceAudioSink = sink;
+            Thread t = new Thread(() -> {
+                byte[] buf = new byte[2048];
+                while (!sink.isClosed()) {
+                    try {
+                        sink.receive(new DatagramPacket(buf, buf.length));
+                    } catch (Exception e) {
+                        return;
+                    }
+                }
+            }, "ConfAudioSink");
+            t.setDaemon(true);
+            t.start();
+        } catch (Exception e) {
+            System.err.println("会议音频端口绑定失败（不影响应用层音频）: " + e.getMessage());
+        }
+    }
+
+    /** 启动会议音频：采集 -> 中继扇出 -> 客户端混音播放。 */
+    private void startConferenceAudio() {
+        if (confVideo == null) {
+            System.err.println("会议音频需要先启动会议视频通道，已跳过");
+            return;
+        }
+        try {
+            confAudio = new ConferenceAudio(confVideo, username);
+            confAudio.start();
+        } catch (Exception e) {
+            System.err.println("启动会议音频失败: " + e.getMessage());
+            stopConferenceAudio();
+        }
+    }
+
+    private void stopConferenceAudio() {
+        if (confAudio != null) {
+            confAudio.stop();
+            confAudio = null;
+        }
+        if (conferenceAudioSink != null) {
+            try { conferenceAudioSink.close(); } catch (Exception ignore) { }
+            conferenceAudioSink = null;
+        }
+    }
+
     /**
-     * 启动会议视频：加入与会议室号同名的视频房间。
-     * 音频仍走 SIP 会议室（服务器混音），视频走应用层中继，因此支持多人。
+     * 启动会议视频：加入与会议室号同名的媒体房间。
+     * 视频与音频都走应用层中继，因此支持多人，且不会把发言者的声音回传给自己。
      */
     private void startConferenceVideo() {
         if (!VIDEO_ENABLED) return;
@@ -976,22 +1041,27 @@ public class SipVideoCallClient implements SipListener {
         inviteTransaction = null;
         System.out.println("\n停止音频流...");
         levelMonitorRunning = false;
+        boolean conference = conferenceRoom != null;
         stopVideo();
+        stopConferenceAudio();
         stopConferenceVideo();
         conferenceRoom = null;
 
-        // 先打印收发统计：用于判断音频是否真的双向流动（不依赖人耳）
-        long sent = (rtpSender != null) ? rtpSender.getPacketsSent() : 0;
-        long recv = (rtpReceiver != null) ? rtpReceiver.getPacketsReceived() : 0;
-        System.out.println("=== RTP 收发统计 ===");
-        System.out.println("  已发送音频包: " + sent);
-        System.out.println("  已接收音频包: " + recv);
-        if (recv == 0) {
-            System.out.println("  !! 未收到任何音频包 —— 对端到你方向不通");
-        } else if (sent == 0) {
-            System.out.println("  !! 未发送任何音频包 —— 麦克风可能没采集到数据");
-        } else {
-            System.out.println("  OK 双向都有音频包，媒体通道正常");
+        // 先打印收发统计：用于判断音频是否真的双向流动（不依赖人耳）。
+        // 会议模式不走 RTP，统计恒为 0，不能据此判断媒体是否通畅。
+        if (!conference) {
+            long sent = (rtpSender != null) ? rtpSender.getPacketsSent() : 0;
+            long recv = (rtpReceiver != null) ? rtpReceiver.getPacketsReceived() : 0;
+            System.out.println("=== RTP 收发统计 ===");
+            System.out.println("  已发送音频包: " + sent);
+            System.out.println("  已接收音频包: " + recv);
+            if (recv == 0) {
+                System.out.println("  !! 未收到任何音频包 —— 对端到你方向不通");
+            } else if (sent == 0) {
+                System.out.println("  !! 未发送任何音频包 —— 麦克风可能没采集到数据");
+            } else {
+                System.out.println("  OK 双向都有音频包，媒体通道正常");
+            }
         }
 
         stopAudioMedia();

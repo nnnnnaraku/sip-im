@@ -29,7 +29,12 @@ import java.util.concurrent.ConcurrentHashMap;
  *   4 FRAME   [4][senderId:4][jpeg...]              中继 -> 客户端
  *   5 JOINED  [5][senderId:4][nameLen][name]        中继 -> 客户端
  *   6 LEFT    [6][senderId:4]                       中继 -> 客户端
+ *   7 AUDIO   [7][roomLen][room][userLen][user][seq:2][pcm...]   客户端 -> 中继
+ *   8 AUDIO   [8][senderId:4][seq:2][pcm...]                     中继 -> 客户端
  * </pre>
+ *
+ * <p>音频帧承载 20ms 的 16bit 小端 PCM（320 字节），由客户端自行混音播放；
+ * 中继只按房间扇出原始音频帧，不做混音，因此不会把发送者自己的声音回传给他。
  *
  * <p>加入时客户端会告知自己的「接收端口」，中继据此把画面发到该端口；
  * 客户端发帧用的可能是另一个端口，所以帧里必须携带房间与用户名。
@@ -54,6 +59,7 @@ public class VideoRelay {
     private DatagramSocket socket;
     private int nextId = 1;
     private volatile long relayedFrames = 0;
+    private volatile long relayedAudio = 0;
 
     public VideoRelay(int port) {
         this.port = port;
@@ -105,6 +111,7 @@ public class VideoRelay {
             case 1: join(pkt, b, len); break;
             case 2: frame(pkt, b, len); break;
             case 3: leave(b, len); break;
+            case 7: audioFrame(pkt, b, len); break;
             default: break; // 未知类型忽略
         }
     }
@@ -175,6 +182,28 @@ public class VideoRelay {
         notifyLeft(p);
     }
 
+    /** 会议音频帧：只按房间扇出，不回传给发送者，也不做混音。 */
+    private void audioFrame(DatagramPacket pkt, byte[] b, int len) throws Exception {
+        String[] ru = readRoomUser(b, len, 1);
+        if (ru == null) return;
+        int off = Integer.parseInt(ru[2]);
+        if (off + 2 > len) return;
+        String room = ru[0];
+        String fromKey = key(room, ru[1]);
+        Participant p = byKey.get(fromKey);
+        if (p == null) return;
+        p.lastSeen = System.currentTimeMillis();
+
+        // 中继帧：类型 8 + 发送者 id + （seq:2 + PCM 原样转发）
+        int payloadLen = len - off;
+        byte[] out = new byte[1 + 4 + payloadLen];
+        out[0] = 8;
+        writeInt(out, 1, p.id);
+        System.arraycopy(b, off, out, 5, payloadLen);
+        broadcast(room, fromKey, out);
+        relayedAudio++;
+    }
+
     /** 把数据发给同房间的“其他人”（不回发给发送者本人） */
     private void broadcast(String room, String fromKey, byte[] data) {
         for (Map.Entry<String, Participant> e : byKey.entrySet()) {
@@ -221,10 +250,12 @@ public class VideoRelay {
                 notifyLeft(p);
             }
             if (now - lastReport >= 30000) {
-                if (relayedFrames > 0 && !byKey.isEmpty()) {
-                    System.out.println("[中继] 在线 " + byKey.size() + " 人，近 30 秒转发 " + relayedFrames + " 帧");
+                if ((relayedFrames > 0 || relayedAudio > 0) && !byKey.isEmpty()) {
+                    System.out.println("[中继] 在线 " + byKey.size() + " 人，近 30 秒转发视频 "
+                            + relayedFrames + " 帧 / 音频 " + relayedAudio + " 帧");
                 }
                 relayedFrames = 0;
+                relayedAudio = 0;
                 lastReport = now;
             }
         }
