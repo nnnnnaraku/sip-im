@@ -721,6 +721,8 @@ public class SipVideoCallClient implements SipListener {
             // 若用独立端口发送，对端做对称 RTP 校验时会丢弃数据包，导致单向/无音频。
             rtpSender = new RTPAudioSender(rtpReceiver.getSocket(), audio.getCodec(), audio.getPayloadType());
             rtpSender.setRemote(remoteAudioIp, remoteAudioPort);
+            // 把本机 SSRC 告诉接收端：若服务器把本机发出的流回环回来，直接丢弃。
+            rtpReceiver.setLocalSsrc(rtpSender.getSsrc());
             final RTPAudioSender sender = rtpSender;
 
             // 启动音频采集

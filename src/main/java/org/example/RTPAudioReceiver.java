@@ -12,6 +12,8 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 /** Receives only negotiated G.711 RTP; unknown/DTMF payloads are never played as audio. */
 public class RTPAudioReceiver {
@@ -27,6 +29,14 @@ public class RTPAudioReceiver {
     private volatile long malformedPackets;
     private volatile long receiveFailures;
     private volatile int recvLevel;
+    /** 本机发送流的 SSRC；收到同 SSRC 的包说明被服务器回环，必须丢弃。 */
+    private volatile int localSsrc;
+    private volatile long ignoredSelf;
+    private volatile long duplicatePackets;
+    /** 按 SSRC 统计来源，便于判断对端音频是否真的到达。 */
+    private final Map<Integer, SourceStat> sources = new ConcurrentHashMap<>();
+    private volatile long lastSourceReport;
+    private volatile int sourceReports;
 
     interface PcmSink { void play(byte[] pcm); }
 
@@ -100,6 +110,10 @@ public class RTPAudioReceiver {
     public long getMalformedPackets() { return malformedPackets; }
     public long getReceiveFailures() { return receiveFailures; }
     public int getRecvLevel() { return recvLevel; }
+    public long getIgnoredSelf() { return ignoredSelf; }
+    public long getDuplicatePackets() { return duplicatePackets; }
+    /** 必须在发送器创建后调用；收到相同 SSRC 的包会被当作回环丢弃。 */
+    public void setLocalSsrc(int ssrc) { this.localSsrc = ssrc; }
 
     public synchronized void start() {
         if (stopped) throw new IllegalStateException("RTP receiver is stopped");
@@ -129,6 +143,25 @@ public class RTPAudioReceiver {
                     continue;
                 }
                 packetsReceived++;
+                int off = packet.getOffset();
+                int ssrc = ((packet.getData()[off + 8] & 0xFF) << 24)
+                        | ((packet.getData()[off + 9] & 0xFF) << 16)
+                        | ((packet.getData()[off + 10] & 0xFF) << 8)
+                        | (packet.getData()[off + 11] & 0xFF);
+                int seq = ((packet.getData()[off + 2] & 0xFF) << 8) | (packet.getData()[off + 3] & 0xFF);
+                SourceStat stat = sources.computeIfAbsent(ssrc, k -> new SourceStat());
+                if (localSsrc != 0 && ssrc == localSsrc) {
+                    // 服务器把本机发出的流回环回来：绝不能播放，否则就是“自听回声”。
+                    ignoredSelf++;
+                    packetsReceived--;
+                    continue;
+                }
+                if (stat.duplicate(seq)) {
+                    duplicatePackets++;
+                    packetsReceived--;
+                    continue;
+                }
+                stat.packets.incrementAndGet();
                 if (packetsReceived == 1) {
                     System.out.println("First negotiated RTP audio: " + packet.getAddress().getHostAddress()
                             + ":" + packet.getPort() + ", PT=" + decoded.payloadType);
@@ -137,6 +170,7 @@ public class RTPAudioReceiver {
                 if (running) sink.play(decoded.pcm);
             } catch (SocketTimeoutException timeout) {
                 // An idle receiver rechecks the shutdown flag.
+                reportSources();
             } catch (Exception failure) {
                 if (running) {
                     limitedWarning("RTP receive/playback failed", ++receiveFailures, failure.getMessage());
@@ -204,6 +238,58 @@ public class RTPAudioReceiver {
             this.payloadType = payloadType;
             this.pcm = pcm;
         }
+    }
+
+    /**
+     * 每个 SSRC 的序列号窗口：重复包直接丢弃。
+     * RTP over UDP 可能重复送达，若不去重会表现为“复读”。
+     */
+    private static final class SourceStat {
+        final AtomicLong packets = new AtomicLong();
+        private long highest = -1;
+        private long bitmap;
+
+        synchronized boolean duplicate(int seq16) {
+            long seq;
+            if (highest < 0) {
+                seq = seq16;
+            } else {
+                long base = highest & ~0xFFFFL;
+                long candidate = base | (seq16 & 0xFFFF);
+                if (candidate < highest - 32768) candidate += 65536;
+                else if (candidate > highest + 32768) candidate -= 65536;
+                seq = candidate;
+            }
+            if (seq <= highest - 64) return true;
+            if (seq > highest) {
+                long shift = seq - highest;
+                bitmap = shift >= 64 ? 0 : (bitmap << shift);
+                highest = seq;
+                bitmap |= 1L;
+                return false;
+            }
+            long mask = 1L << (highest - seq);
+            if ((bitmap & mask) != 0) return true;
+            bitmap |= mask;
+            return false;
+        }
+    }
+
+    /** 前 60 秒打印每个来源的包数，用于判断对端音频是否真的到达。 */
+    private void reportSources() {
+        if (sources.isEmpty() || sourceReports >= 6) return;
+        long now = System.currentTimeMillis();
+        if (lastSourceReport != 0 && now - lastSourceReport < 10000) return;
+        lastSourceReport = now;
+        sourceReports++;
+        StringBuilder line = new StringBuilder("[RTP 源统计] ");
+        for (Map.Entry<Integer, SourceStat> entry : sources.entrySet()) {
+            line.append("SSRC=").append(Integer.toHexString(entry.getKey()));
+            if (entry.getKey() == localSsrc) line.append("(本机回环)");
+            line.append(" 包数=").append(entry.getValue().packets.get()).append("；");
+        }
+        line.append("丢弃回环=").append(ignoredSelf).append("，重复=").append(duplicatePackets);
+        System.out.println(line);
     }
 
     /** No drain: a stalled device must not make hangup wait indefinitely. */

@@ -143,6 +143,8 @@ public class RTPAudioSender {
     public long getSendFailures() { return sendFailures; }
     public IOException getLastSendFailure() { return lastSendFailure; }
     public int getMicLevel() { return micLevel; }
+    /** 本机发送流的 SSRC，接收端据此识别并丢弃被服务器回环回来的自己的包。 */
+    public int getSsrc() { return ssrc; }
 
     public synchronized void close() {
         if (closed) return;
