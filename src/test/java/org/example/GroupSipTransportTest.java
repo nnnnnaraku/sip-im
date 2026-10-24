@@ -240,7 +240,8 @@ public class GroupSipTransportTest {
         assertEquals(0, groups.get());
         client.sendMessage("#FILE|invalid");
         int messageCount = ui.messages;
-        assertEquals(200, receive(sent.get(1)));
+        int status = receive(sent.get(1));
+        assertTrue("malformed file frame must be rejected: " + status, status >= 400 && status <= 499);
         assertEquals(messageCount, ui.messages);
         assertEquals(0, groups.get());
     }

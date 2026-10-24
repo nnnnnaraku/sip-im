@@ -344,6 +344,8 @@ function connectStream() {
     if (d.peer) { PEER = d.peer; $("peer").textContent = PEER; }
   } else if (d.t === "msg") {
     bubble(d.out, d.peer, d.text);
+  } else if (d.t === "file-error") {
+    sys("附件接收失败：" + (d.error || "无效或超限文件"));
   } else if (d.t === "file") {
     let el;
     if (d.ftype === "IMG") { el = document.createElement("img"); el.src = d.url; }

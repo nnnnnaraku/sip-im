@@ -246,11 +246,14 @@ public class WebSecurityIntegrationTest {
         byte[] sample = new byte[]{0, 1, 2, (byte) 255, 10};
         for (String type : Arrays.asList("IMG", "VOICE", "VIDEO")) {
             String name = "sample-" + type + ".bin";
-            assertOk(request("POST", "/api/file?type=" + type + "&name=" + name, sample, true, true));
+            Result upload = request("POST", "/api/file?type=" + type + "&name=" + name, sample, true, true);
+            assertOk(upload);
+            // 存储名与显示名分离：下载必须使用服务端返回的受权 URL，而不是原始文件名。
+            String url = json(upload).get("url").getAsString();
             assertEquals(type, fakeSip.lastFileType);
             assertArrayEquals(sample, fakeSip.lastFileBytes);
-            assertEquals(401, request("GET", "/files/" + name, null, false, false).status);
-            Result file = request("GET", "/files/" + name, null, true, false);
+            assertEquals(401, request("GET", url, null, false, false).status);
+            Result file = request("GET", url, null, true, false);
             assertEquals(200, file.status);
             assertArrayEquals(sample, file.body);
         }
@@ -437,5 +440,6 @@ public class WebSecurityIntegrationTest {
         @Override public synchronized void startVoiceRecord() { recordStarts.incrementAndGet(); calls.incrementAndGet(); }
         @Override public synchronized String stopVoiceRecordAndSend() { recordStops.incrementAndGet(); calls.incrementAndGet(); return "synthetic.wav"; }
         @Override public void sendFile(File file, String type) throws Exception { lastFileType = type; lastFileBytes = Files.readAllBytes(file.toPath()); files.incrementAndGet(); calls.incrementAndGet(); }
+        @Override public void sendFile(File file, String type, String originalName) throws Exception { sendFile(file, type); }
     }
 }

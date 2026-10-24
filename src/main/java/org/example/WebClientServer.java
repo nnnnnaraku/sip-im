@@ -21,7 +21,6 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Base64;
@@ -70,6 +69,14 @@ public class WebClientServer {
         Thread thread = new Thread(task, "GroupUiEvents"); thread.setDaemon(true); return thread;
     });
     private static Path RECEIVED_DIR = Paths.get("received");
+    private static final ReceivedFileStore FILES = new ReceivedFileStore(RECEIVED_DIR);
+    private static final FileHttpApi FILE_API = new FileHttpApi(FILES,
+            () -> sip != null && sip.isRegistered(),
+            (file, type) -> {
+                SipVideoCallClient current = sip;
+                if (current == null || !current.isRegistered()) throw new IllegalStateException("SIP_NOT_REGISTERED");
+                current.sendFile(file.getPath().toFile(), type, file.getOriginalName());
+            });
     private static final Semaphore SSE_SLOTS = new Semaphore(4);
 
     public static void main(String[] args) throws Exception {
@@ -98,7 +105,7 @@ public class WebClientServer {
         // 2) 再启动 SIP 引擎（放到后台线程，避免阻塞 Web 服务）
         Thread engine = new Thread(() -> {
             try {
-                sip = new SipVideoCallClient();
+                sip = new SipVideoCallClient(FILES);
                 sip.setUi(new UiBridge());
                 sip.setGroupMessageHandler(GROUPS::receive);
                 sip.init();
@@ -149,7 +156,7 @@ public class WebClientServer {
                     case "/api/state": handleState(ex); break;
                     case "/api/contacts": handleContacts(ex); break;
                     case "/api/send": handleSend(ex); break;
-                    case "/api/file": handleFile(ex); break;
+                    case "/api/file": FILE_API.handle(ex); break;
                     case "/api/call": handleCall(ex); break;
                     case "/api/hangup": handleHangup(ex); break;
                     case "/api/record": handleRecord(ex); break;
@@ -157,7 +164,7 @@ public class WebClientServer {
                     case "/api/record/stop": handleRecordStop(ex); break;
                     case "/api/setpeer": handleSetPeer(ex); break;
                     default:
-                        if (path.startsWith("/files/")) handleFiles(ex);
+                        if (path.startsWith("/files/")) FILE_API.handle(ex);
                         else sendText(ex, 404, "NOT_FOUND");
                 }
             } catch (Exception failure) {
@@ -253,33 +260,6 @@ public class WebClientServer {
             sendJson(ex, ok());
         } catch (Exception e) {
             sendJson(ex, 500, err("消息发送失败"));
-        }
-    }
-
-    /** 上传并发送文件：POST /api/file?name=xxx&type=IMG|VOICE|VIDEO，body 为文件原始字节 */
-    private static void handleFile(HttpExchange ex) {
-        try {
-            if (sip == null || !sip.isRegistered()) {
-                sendJson(ex, err("尚未注册成功"));
-                return;
-            }
-            String query = ex.getRequestURI().getRawQuery();
-            String name = param(query, "name");
-            String type = param(query, "type");
-            if (name == null || name.trim().isEmpty()) name = "file.bin";
-            if (type == null || type.trim().isEmpty()) type = "IMG";
-            name = sanitize(name);
-
-            byte[] data = readBodyBytes(ex);
-            File dir = RECEIVED_DIR.toFile();
-            if (!dir.exists()) dir.mkdirs();
-            File out = new File(dir, name);
-            Files.write(out.toPath(), data);
-
-            sip.sendFile(out, type);
-            sendJson(ex, ok());
-        } catch (Exception e) {
-            sendJson(ex, 500, err("文件发送失败"));
         }
     }
 
@@ -412,14 +392,16 @@ public class WebClientServer {
 
         @Override
         public void onFile(String peer, String type, String name, String path, boolean outgoing) {
-            JsonObject o = new JsonObject();
-            o.addProperty("t", "file");
-            o.addProperty("peer", peer);
-            o.addProperty("ftype", type);
-            o.addProperty("name", name);
-            o.addProperty("url", "/files/" + name);
-            o.addProperty("out", outgoing);
-            broadcast(o);
+            broadcast(attachmentEvent(FILES, peer, type, name, path, outgoing));
+        }
+
+        @Override
+        public void onFileError(String peer, String reason) {
+            JsonObject event = new JsonObject();
+            event.addProperty("t", "file-error");
+            event.addProperty("peer", peer);
+            event.addProperty("error", reason);
+            broadcast(event);
         }
 
         @Override
@@ -492,48 +474,20 @@ public class WebClientServer {
         }
     }
 
-    // ---------------- 文件访问 ----------------
-
-    /** GET /files/<name> —— 把 received/ 下的文件提供给浏览器（图片/视频展示用） */
-    private static void handleFiles(HttpExchange ex) {
-        try {
-            String path = ex.getRequestURI().getPath();
-            String name = sanitize(path.substring(path.lastIndexOf('/') + 1));
-            File f = RECEIVED_DIR.resolve(name).toFile();
-            if (!f.exists() || !f.isFile()) {
-                sendText(ex, 404, "文件不存在");
-                return;
-            }
-            byte[] body = Files.readAllBytes(f.toPath());
-            String contentType = guessType(name);
-            ex.getResponseHeaders().set("Content-Type", contentType);
-            if ("application/octet-stream".equals(contentType)) {
-                ex.getResponseHeaders().set("Content-Disposition", "attachment");
-            }
-            if ("HEAD".equals(ex.getRequestMethod())) {
-                ex.getResponseHeaders().set("Content-Length", Integer.toString(body.length));
-                ex.sendResponseHeaders(200, -1);
-                ex.close();
-                return;
-            }
-            ex.sendResponseHeaders(200, body.length);
-            try (OutputStream os = ex.getResponseBody()) {
-                os.write(body);
-            }
-        } catch (Exception e) {
-            sendText(ex, 500, "读取文件失败");
-        }
-    }
-
-    private static String guessType(String name) {
-        String n = name.toLowerCase();
-        if (n.endsWith(".jpg") || n.endsWith(".jpeg")) return "image/jpeg";
-        if (n.endsWith(".png")) return "image/png";
-        if (n.endsWith(".gif")) return "image/gif";
-        if (n.endsWith(".wav")) return "audio/wav";
-        if (n.endsWith(".mp4")) return "video/mp4";
-        if (n.endsWith(".webm")) return "video/webm";
-        return "application/octet-stream";
+    /** The display name stays separate from the authorized stored-file URL. */
+    static JsonObject attachmentEvent(ReceivedFileStore store, String peer, String type,
+                                      String originalName, String savedPath, boolean outgoing) {
+        ReceivedFileStore.validateOriginalName(originalName);
+        Path saved = Paths.get(savedPath).toAbsolutePath().normalize();
+        if (!store.getRoot().equals(saved.getParent())) throw new IllegalArgumentException("FILE_OUTSIDE_RECEIVE_ROOT");
+        JsonObject event = new JsonObject();
+        event.addProperty("t", "file");
+        event.addProperty("peer", peer);
+        event.addProperty("ftype", type);
+        event.addProperty("name", originalName);
+        event.addProperty("url", FileHttpApi.fileUrl(saved.getFileName().toString()));
+        event.addProperty("out", outgoing);
+        return event;
     }
 
     // ---------------- 工具 ----------------
@@ -633,15 +587,6 @@ public class WebClientServer {
     private static void requireUser(String user) {
         if (user == null || !user.matches("[A-Za-z0-9_.+*\\-]{1,64}"))
             throw new IllegalArgumentException("Invalid SIP user");
-    }
-
-    /** Legacy filename handling; receive/storage hardening lives in the independent file-security change. */
-    private static String sanitize(String name) {
-        String n = name.replace('\\', '/');
-        int i = n.lastIndexOf('/');
-        if (i >= 0) n = n.substring(i + 1);
-        n = n.replace("..", "_");
-        return n.isEmpty() ? "file.bin" : n;
     }
 
     private static String str(JsonObject o, String key) {

@@ -484,6 +484,8 @@ Test-Connection -ComputerName <B 机 IP> -Count 2
 
 多人文字群聊的架构、限制、自动测试与三端验收：[GROUP_TEXT_CHAT.md](GROUP_TEXT_CHAT.md)。
 
+文件接收安全、配额边界与独立验收说明：[FILE_RECEIVE_SECURITY.txt](FILE_RECEIVE_SECURITY.txt)。
+
 | 文档 | 用途 |
 |---|---|
 | **README.md**（本文） | 项目总览、选型、架构、现状 |
