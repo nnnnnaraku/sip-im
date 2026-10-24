@@ -164,7 +164,8 @@ public class WebClientServer {
                     case "/api/record/stop": handleRecordStop(ex); break;
                     case "/api/setpeer": handleSetPeer(ex); break;
                     default:
-                        if (path.startsWith("/files/")) FILE_API.handle(ex);
+                        if (path.startsWith("/api/groups/")) GROUPS_API.handle(ex);
+                        else if (path.startsWith("/files/")) FILE_API.handle(ex);
                         else sendText(ex, 404, "NOT_FOUND");
                 }
             } catch (Exception failure) {
