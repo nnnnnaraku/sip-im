@@ -15,6 +15,9 @@ import java.nio.file.Files;
 import java.security.MessageDigest;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BiFunction;
 import java.util.regex.*;
 
 public class SipVideoCallClient implements SipListener {
@@ -89,6 +92,12 @@ public class SipVideoCallClient implements SipListener {
     }
 
     private volatile Ui ui;
+    private volatile BiFunction<String, String, Integer> groupMessageHandler;
+
+    /** Group MIME has a dedicated handler; rejected envelopes never become private messages. */
+    public void setGroupMessageHandler(BiFunction<String, String, Integer> handler) {
+        this.groupMessageHandler = handler;
+    }
 
     /** Web 模式注入 UI 回调 */
     public void setUi(Ui ui) {
@@ -150,7 +159,7 @@ public class SipVideoCallClient implements SipListener {
     }
 
     /** 文字消息的 CSeq 序号，每发一条递增 */
-    private long messageCSeq = 1;
+    private final AtomicLong messageCSeq = new AtomicLong(1);
 
     /**
      * 文件分片大小（Base64 字符数），图片与语音消息共用。
@@ -1048,9 +1057,50 @@ public class SipVideoCallClient implements SipListener {
 
     /** 向被叫发送一条文字消息 */
     public void sendMessage(String text) throws Exception {
-        sendRaw(text);
-        EventLog.log("MSG", "OUT", targetUser, "TEXT:" + text.length());
-        notifyMessage(targetUser, text, true);
+        String recipient = targetUser;
+        sendRawTo(recipient, text, "text", "plain", null);
+        EventLog.log("MSG", "OUT", recipient, "TEXT:" + text.length());
+        notifyMessage(recipient, text, true);
+    }
+
+    /** Explicit group recipient is independent of the selected private-chat contact. */
+    public void sendGroupEnvelope(String recipient, String body, GroupTransport.Completion completion)
+            throws Exception {
+        GroupProtocol.user(recipient);
+        if (body == null || completion == null) {
+            throw new IllegalArgumentException("Group body and completion are required");
+        }
+        sendRawTo(recipient, body, "application", "vnd.sip-im.group+json", new GroupReceipt(completion));
+    }
+
+    private static final class GroupReceipt {
+        private final GroupTransport.Completion completion;
+        private final AtomicBoolean finished = new AtomicBoolean();
+
+        private GroupReceipt(GroupTransport.Completion completion) {
+            this.completion = completion;
+        }
+
+        private void complete(boolean accepted, String detail) {
+            if (!finished.compareAndSet(false, true)) return;
+            try {
+                completion.completed(accepted, detail);
+            } catch (RuntimeException ex) {
+                System.err.println("Group completion handler failed: " + ex.getClass().getSimpleName());
+            }
+        }
+    }
+
+    private static void completeGroupReceipt(ClientTransaction transaction, boolean accepted, String detail) {
+        if (transaction == null) return;
+        Object data = transaction.getApplicationData();
+        if (data instanceof GroupReceipt) ((GroupReceipt) data).complete(accepted, detail);
+    }
+
+    static boolean isGroupMessage(Request request) {
+        ContentTypeHeader type = (ContentTypeHeader) request.getHeader(ContentTypeHeader.NAME);
+        return type != null && GroupProtocol.MEDIA_TYPE.equalsIgnoreCase(
+                type.getContentType() + "/" + type.getContentSubType());
     }
 
     /** 当前对端分机 */
@@ -1125,11 +1175,16 @@ public class SipVideoCallClient implements SipListener {
 
     /** 向被叫发送一条 SIP MESSAGE，body 为消息体原文 */
     private void sendRaw(String body) throws Exception {
+        sendRawTo(targetUser, body, "text", "plain", null);
+    }
+
+    private void sendRawTo(String recipient, String body, String mediaType, String mediaSubtype,
+                           GroupReceipt receipt) throws Exception {
         String fromSipAddress = "sip:" + username + "@" + serverIp;
         Address fromAddress = addressFactory.createAddress(fromSipAddress);
         FromHeader fromHeader = headerFactory.createFromHeader(fromAddress, String.valueOf(System.currentTimeMillis()));
 
-        String toSipAddress = "sip:" + targetUser + "@" + serverIp;
+        String toSipAddress = "sip:" + recipient + "@" + serverIp;
         Address toAddress = addressFactory.createAddress(toSipAddress);
         ToHeader toHeader = headerFactory.createToHeader(toAddress, null);
 
@@ -1138,10 +1193,10 @@ public class SipVideoCallClient implements SipListener {
         viaHeaders.add(viaHeader);
 
         CallIdHeader callIdHeader = sipProvider.getNewCallId();
-        CSeqHeader cSeqHeader = headerFactory.createCSeqHeader(messageCSeq++, Request.MESSAGE);
+        CSeqHeader cSeqHeader = headerFactory.createCSeqHeader(messageCSeq.getAndIncrement(), Request.MESSAGE);
         MaxForwardsHeader maxForwards = headerFactory.createMaxForwardsHeader(70);
 
-        SipURI requestURI = addressFactory.createSipURI(targetUser, serverIp);
+        SipURI requestURI = addressFactory.createSipURI(recipient, serverIp);
         requestURI.setPort(serverPort);
 
         Request request = messageFactory.createRequest(requestURI, Request.MESSAGE,
@@ -1152,15 +1207,21 @@ public class SipVideoCallClient implements SipListener {
         Address contactAddress = addressFactory.createAddress(contactURI);
         request.addHeader(headerFactory.createContactHeader(contactAddress));
 
-        // 声明可接收纯文本，便于对端回复
-        request.addHeader(headerFactory.createAcceptHeader("text", "plain"));
+        // Keep private/file MIME unchanged and advertise the group MIME on group sends.
+        request.addHeader(headerFactory.createAcceptHeader(mediaType, mediaSubtype));
 
         // SIP 消息体统一使用 UTF-8，避免中文乱码
-        ContentTypeHeader contentTypeHeader = headerFactory.createContentTypeHeader("text", "plain");
+        ContentTypeHeader contentTypeHeader = headerFactory.createContentTypeHeader(mediaType, mediaSubtype);
         request.setContent(body.getBytes(StandardCharsets.UTF_8), contentTypeHeader);
 
-        ClientTransaction transaction = sipProvider.getNewClientTransaction(request);
-        transaction.sendRequest();
+        try {
+            ClientTransaction transaction = sipProvider.getNewClientTransaction(request);
+            if (receipt != null) transaction.setApplicationData(receipt);
+            transaction.sendRequest();
+        } catch (Exception ex) {
+            if (receipt != null) receipt.complete(false, "LOCAL_SEND_ERROR");
+            throw ex;
+        }
     }
 
     // ---------- 文件消息（Base64 分片，走 SIP MESSAGE）----------
@@ -1445,9 +1506,39 @@ public class SipVideoCallClient implements SipListener {
                     serverTransaction = sipProvider.getNewServerTransaction(request);
                 }
                 byte[] raw = request.getRawContent();
-                String text = (raw == null) ? "" : new String(raw, StandardCharsets.UTF_8);
                 FromHeader msgFrom = (FromHeader) request.getHeader(FromHeader.NAME);
                 String peer = peerOf(msgFrom);
+                if (isGroupMessage(request)) {
+                    if (raw != null && raw.length > GroupProtocol.MAX_WIRE_BYTES) {
+                        serverTransaction.sendResponse(messageFactory.createResponse(Response.REQUEST_ENTITY_TOO_LARGE, request));
+                        return;
+                    }
+                    final String groupText;
+                    try {
+                        groupText = raw == null ? "" : StandardCharsets.UTF_8.newDecoder()
+                                .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+                                .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+                                .decode(java.nio.ByteBuffer.wrap(raw)).toString();
+                    } catch (java.nio.charset.CharacterCodingException invalidUtf8) {
+                        serverTransaction.sendResponse(messageFactory.createResponse(Response.BAD_REQUEST, request));
+                        return;
+                    }
+                    int status = Response.SERVICE_UNAVAILABLE;
+                    BiFunction<String, String, Integer> handler = groupMessageHandler;
+                    if (handler != null) {
+                        try {
+                            Integer result = handler.apply(peer, groupText);
+                            status = result != null && result >= 200 && result <= 699
+                                    ? result : Response.SERVER_INTERNAL_ERROR;
+                        } catch (RuntimeException ex) {
+                            status = Response.SERVER_INTERNAL_ERROR;
+                            System.err.println("Group message handler failed: " + ex.getClass().getSimpleName());
+                        }
+                    }
+                    serverTransaction.sendResponse(messageFactory.createResponse(status, request));
+                    return;
+                }
+                String text = (raw == null) ? "" : new String(raw, StandardCharsets.UTF_8);
                 if (text.startsWith("#FILE|")) {
                     handleFileChunk(text, peer);
                 } else {
@@ -1570,6 +1661,7 @@ public class SipVideoCallClient implements SipListener {
         int statusCode = response.getStatusCode();
         CSeqHeader cseq = (CSeqHeader) response.getHeader(CSeqHeader.NAME);
         ClientTransaction clientTransaction = responseEvent.getClientTransaction();
+        if (cseq == null) return;
 
         System.out.println("\n收到响应: " + statusCode + " " + response.getReasonPhrase() +
                 " (CSeq: " + cseq.getMethod() + ")");
@@ -1625,6 +1717,11 @@ public class SipVideoCallClient implements SipListener {
                 } else if (statusCode >= 400) {
                     System.out.println("呼叫失败: " + statusCode);
                 }
+            } else if (cseq.getMethod().equals(Request.MESSAGE)) {
+                if (statusCode >= 200) {
+                    completeGroupReceipt(clientTransaction, statusCode < 300,
+                            (statusCode < 300 ? "SIP_ACCEPTED_" : "SIP_REJECTED_") + statusCode);
+                }
             } else if (cseq.getMethod().equals(Request.BYE)) {
                 if (statusCode == Response.OK) {
                     System.out.println("通话已正常结束");
@@ -1644,6 +1741,9 @@ public class SipVideoCallClient implements SipListener {
         // 而不用干等到下一个重注册周期。
         try {
             ClientTransaction tx = timeoutEvent.getClientTransaction();
+            if (Timeout.TRANSACTION.equals(timeoutEvent.getTimeout())) {
+                completeGroupReceipt(tx, false, "SIP_TIMEOUT");
+            }
             if (tx != null && tx.getRequest() != null
                     && Request.REGISTER.equals(tx.getRequest().getMethod())) {
                 System.out.println("[注册超时] 30 秒后自动重试注册...");

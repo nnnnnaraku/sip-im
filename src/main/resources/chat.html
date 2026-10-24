@@ -113,6 +113,25 @@
   }
   .confcell img { width: 100%; border-radius: 9px; display: block; background: #0f172a; }
   .confcell .cap { font-size: 11.5px; color: #64748b; text-align: center; margin-top: 3px; }
+  .group-heading { display: flex; align-items: center; justify-content: space-between; margin-top: 20px; }
+  .group-heading h3 { margin: 0; }
+  .group-heading button, .group-action { border: 1px solid #cbd5e1; background: #fff; border-radius: 6px; padding: 5px 8px; cursor: pointer; }
+  .group-entry { width: 100%; border: none; background: #fff; padding: 9px 8px; text-align: left; cursor: pointer; word-break: break-word; border-radius: 7px; }
+  .group-entry:hover { background: #f1f5f9; }
+  .group-entry.active { background: #dbeafe; }
+  .group-create { padding: 9px 0; font-size: 12px; }
+  .group-create input[type=text] { width: 100%; padding: 7px; margin-bottom: 8px; }
+  .group-choice { display: flex; gap: 5px; padding: 5px 0; word-break: break-word; }
+  .group-muted, .group-delivery { font-size: 11px; opacity: .75; }
+  .group-error { color: #b91c1c; font-size: 12px; white-space: pre-wrap; }
+  .group-panel { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  .group-header { background: #fff; border-bottom: 1px solid #e2e8f0; padding: 10px 18px; }
+  .group-header h2 { font-size: 17px; margin: 0 0 5px; }
+  .group-header p { margin: 4px 0; word-break: break-word; }
+  .group-controls { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .group-members { max-height: 100px; overflow-y: auto; font-size: 12px; }
+  #groupMessages { flex: 1; overflow-y: auto; min-height: 80px; padding: 16px 20px; }
+  .group-panel button:disabled { opacity: .5; cursor: default; }
   .hidden { display: none !important; }
 </style>
 </head>
@@ -128,6 +147,17 @@
   <aside>
     <h3>联系人 / 在线状态</h3>
     <div id="contacts"></div>
+    <div class="group-heading"><h3>文字群聊</h3><button type="button" id="btnGroupCreate">创建群</button></div>
+    <div id="groups"></div>
+    <div id="groupCreateForm" class="group-create hidden">
+      <label for="groupName">群名称</label>
+      <input type="text" id="groupName" maxlength="40" placeholder="输入群名称">
+      <div>选择 2～7 位联系人（另含本人）</div>
+      <div id="groupContactChoices"></div>
+      <p class="group-error" id="groupCreateError" role="alert"></p>
+      <button type="button" class="group-action" id="btnGroupConfirm">创建并邀请</button>
+      <button type="button" class="group-action" id="btnGroupCancel">取消</button>
+    </div>
   </aside>
 
   <main>
@@ -144,14 +174,35 @@
       <div class="sys">欢迎使用即时通信 Web 客户端。左侧点选联系人，下方发送消息或发起通话。</div>
     </div>
 
-    <div class="dialbar">
+    <section class="group-panel hidden" id="groupPanel" aria-label="群文字聊天">
+      <div class="group-header">
+        <h2 id="groupTitle">文字群聊</h2>
+        <p id="groupIdentity" class="group-muted"></p>
+        <details><summary>群成员与状态</summary><ul id="groupMembers" class="group-members"></ul></details>
+        <p id="groupError" class="group-error" role="alert"></p>
+        <p id="groupControlStatus" class="group-muted"></p>
+        <p id="groupNotice" class="group-error" role="status" aria-live="polite"></p>
+        <div class="group-controls">
+          <button type="button" class="group-action" id="btnGroupPrivate">返回私聊</button>
+          <button type="button" class="group-action hidden" id="btnGroupJoin">确认加入</button>
+          <button type="button" class="group-action" id="btnGroupSync">同步成员状态</button>
+          <button type="button" class="group-action" id="btnGroupLeave">退出群组</button>
+        </div>
+      </div>
+      <div id="groupMessages" aria-live="polite"></div>
+      <div class="composer">
+        <input type="text" id="groupText" placeholder="群文字消息" autocomplete="off" aria-label="群文字消息">
+        <button type="button" class="primary" id="btnGroupSend">发送群消息</button>
+      </div>
+    </section>
+    <div class="dialbar" id="privateDialbar">
       <span class="diallabel">拨号</span>
       <input type="text" id="dial" placeholder="分机号（如 101），或 *6*1 进入会议室" autocomplete="off">
       <button id="btnDialVoice">语音</button>
       <button id="btnDialVideo">视频</button>
     </div>
 
-    <div class="composer">
+    <div class="composer" id="privateComposer">
       <input type="text" id="text" placeholder="输入消息，回车发送" autocomplete="off">
       <button class="primary" id="btnSend">发送</button>
       <button id="btnImg">图片</button>
@@ -166,6 +217,7 @@
   </main>
 </div>
 
+<script src="/group-chat.js"></script>
 <script>
 const $ = id => document.getElementById(id);
 const chat = $("chat");
@@ -256,9 +308,10 @@ const es = new EventSource("/api/stream");
 es.onmessage = ev => {
   let d;
   try { d = JSON.parse(ev.data); } catch (e) { return; }
+  if (window.GroupChat && window.GroupChat.handleEvent(d)) return;
   if (d.t === "state") {
     setReg(!!d.registered);
-    if (d.me) { ME = d.me; $("me").textContent = ME; }
+    if (d.me) { ME = d.me; $("me").textContent = ME; if (window.GroupChat) window.GroupChat.setIdentity(ME); }
     if (d.peer) { PEER = d.peer; $("peer").textContent = PEER; }
   } else if (d.t === "msg") {
     bubble(d.out, d.peer, d.text);
@@ -307,12 +360,14 @@ async function loadState() {
     const d = await (await fetch("/api/state")).json();
     setReg(!!d.registered);
     ME = d.me; PEER = d.peer;
+    if (window.GroupChat) window.GroupChat.setIdentity(ME);
     $("me").textContent = ME; $("peer").textContent = PEER;
   } catch (e) { setReg(false); }
 }
 async function loadContacts() {
   try {
     const d = await (await fetch("/api/contacts")).json();
+    if (window.GroupChat) window.GroupChat.updateContacts(d.contacts || []);
     const box = $("contacts");
     box.innerHTML = "";
     (d.contacts || []).forEach(c => {
@@ -322,6 +377,7 @@ async function loadContacts() {
       el.onclick = async () => {
         await fetch("/api/setpeer?user=" + encodeURIComponent(c.user), { method: "POST" });
         PEER = c.user; $("peer").textContent = PEER;
+        if (window.GroupChat) window.GroupChat.showPrivate();
         sys("已选择对端 " + PEER);
         loadContacts();
       };
