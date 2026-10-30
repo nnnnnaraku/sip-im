@@ -73,7 +73,7 @@ git log -1 --oneline
 （或整体拷贝 `sipvideo` 文件夹，不带 `target/`）
 
 - [ ] 确认存在 `WebClientServer.java`、`AdminServer.java`、`MssClient.java`、`chat.html`、`dashboard.html`、`run-web.bat`、`run-admin.bat`、`setup-mss.ps1`
-- [ ] 版本为 `4932256` 或更新（含群聊 MIME 修复）；**三端必须同一版本**，否则群聊消息互相不认识
+- [ ] 版本为 `b21443e` 或更新（含群聊 MIME 与麦克风环回修复）；**三端必须同一版本**，否则群聊消息互相不认识
 
 ---
 

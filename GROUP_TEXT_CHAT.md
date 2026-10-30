@@ -78,7 +78,7 @@ mvn -o -gs target/group-settings.xml -s target/group-settings.xml "-Dmaven.repo.
 
 ## A100/B101/C102 人工验收表
 
-> **2026-10-31 状态**：已在 A 机三实例（分机 100/101/102）上完成端到端自测——建 3 人群（中文名）→ 101/102 收到 `INVITED` → 加入后 `ACTIVE` → 100 发群消息，101/102 收到同一 `messageId`，A 侧两项回执 `SIP_ACCEPTED`。B/C **真机**复测仍待完成（需同为 `4932256`）。下表未标注的行仍为 **NOT_RUN**。不要改账号密码/miniSIPServer/防火墙，群文字也无需启动 VideoRelay。
+> **2026-10-31 状态**：已在 A 机三实例（分机 100/101/102）上完成端到端自测——建 3 人群（中文名）→ 101/102 收到 `INVITED` → 加入后 `ACTIVE` → 100 发群消息，101/102 收到同一 `messageId`，A 侧两项回执 `SIP_ACCEPTED`。B/C **真机**复测仍待完成（需同为 `b21443e`）。下表未标注的行仍为 **NOT_RUN**。不要改账号密码/miniSIPServer/防火墙，群文字也无需启动 VideoRelay。
 
 可先准备运行依赖（只构建，不启动）：
 
