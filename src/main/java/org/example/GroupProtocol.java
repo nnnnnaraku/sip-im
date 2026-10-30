@@ -17,7 +17,26 @@ import java.util.UUID;
 
 /** Strict parsing and size/identity checks shared by the SIP and HTTP boundaries. */
 public final class GroupProtocol {
+    /**
+     * 群信封的原始 MIME，仅用于兼容旧版本识别。
+     *
+     * <p>miniSIPServer 会对自定义 {@code application/*+json} 返回
+     * {@code 406 Unsupported Content-Type}，导致群消息根本无法路由，
+     * 因此线上发送改为 {@link #WIRE_MEDIA_TYPE}，并用 {@link #HEADER} 标记。
+     */
     public static final String MEDIA_TYPE = "application/vnd.sip-im.group+json";
+    /** 实际发送使用的 MIME，必须是被 SIP 服务器接受的通用类型。 */
+    public static final String WIRE_MEDIA_TYPE = "text/plain";
+    /** 群信封标记头，用于在 text/plain 中区分群消息与普通文字消息。 */
+    public static final String HEADER = "X-SIP-IM-Group";
+    public static final String HEADER_VALUE = "1";
+    /**
+     * 群信封的正文前缀（{@link GroupMessage} 字段顺序决定）。
+     *
+     * <p>miniSIPServer 在转发 MESSAGE 时会**剥离自定义头**，接收端拿不到
+     * {@link #HEADER}，因此再用正文前缀做一次兜底识别。
+     */
+    public static final String ENVELOPE_PREFIX = "{\"version\":1,\"type\":\"";
     public static final int MAX_MEMBERS = 8;
     public static final int MAX_TEXT_BYTES = 400;
     public static final int MAX_WIRE_BYTES = 800;
@@ -59,6 +78,13 @@ public final class GroupProtocol {
         String result = GSON.toJson(message);
         wire(result);
         return result;
+    }
+
+    /** 正文是否以群信封前缀开头（服务器可能剥离标记头，用正文兜底识别）。 */
+    public static boolean looksLikeEnvelope(byte[] raw) {
+        if (raw == null || raw.length < ENVELOPE_PREFIX.length() || raw.length > MAX_WIRE_BYTES) return false;
+        String head = new String(raw, 0, ENVELOPE_PREFIX.length(), StandardCharsets.UTF_8);
+        return ENVELOPE_PREFIX.equals(head);
     }
 
     public static GroupMessage decode(String wire) {

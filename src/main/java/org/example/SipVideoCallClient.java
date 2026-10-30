@@ -1156,7 +1156,8 @@ public class SipVideoCallClient implements SipListener {
         if (body == null || completion == null) {
             throw new IllegalArgumentException("Group body and completion are required");
         }
-        sendRawTo(recipient, body, "application", "vnd.sip-im.group+json", new GroupReceipt(completion));
+        // 服务器会拒绝自定义 application 子类型（406），因此用 text/plain + 标记头
+        sendRawTo(recipient, body, "text", "plain", new GroupReceipt(completion), true);
     }
 
     private static final class GroupReceipt {
@@ -1184,9 +1185,16 @@ public class SipVideoCallClient implements SipListener {
     }
 
     static boolean isGroupMessage(Request request) {
+        // 群信封标记头（当前协议）：Content-Type 只能是通用类型，靠它区分
+        if (request.getHeader(GroupProtocol.HEADER) != null) return true;
+        // 兼容旧版本：直接使用自定义 MIME 的信封
         ContentTypeHeader type = (ContentTypeHeader) request.getHeader(ContentTypeHeader.NAME);
-        return type != null && GroupProtocol.MEDIA_TYPE.equalsIgnoreCase(
-                type.getContentType() + "/" + type.getContentSubType());
+        if (type != null && GroupProtocol.MEDIA_TYPE.equalsIgnoreCase(
+                type.getContentType() + "/" + type.getContentSubType())) {
+            return true;
+        }
+        // 服务器转发时会剥离自定义头，最后再用正文前缀兜底
+        return GroupProtocol.looksLikeEnvelope(request.getRawContent());
     }
 
     /** 当前对端分机 */
@@ -1280,6 +1288,11 @@ public class SipVideoCallClient implements SipListener {
 
     private void sendRawTo(String recipient, String body, String mediaType, String mediaSubtype,
                            GroupReceipt receipt) throws Exception {
+        sendRawTo(recipient, body, mediaType, mediaSubtype, receipt, false);
+    }
+
+    private void sendRawTo(String recipient, String body, String mediaType, String mediaSubtype,
+                           GroupReceipt receipt, boolean groupEnvelope) throws Exception {
         String fromSipAddress = "sip:" + username + "@" + serverIp;
         Address fromAddress = addressFactory.createAddress(fromSipAddress);
         FromHeader fromHeader = headerFactory.createFromHeader(fromAddress, String.valueOf(System.currentTimeMillis()));
@@ -1307,8 +1320,13 @@ public class SipVideoCallClient implements SipListener {
         Address contactAddress = addressFactory.createAddress(contactURI);
         request.addHeader(headerFactory.createContactHeader(contactAddress));
 
-        // Keep private/file MIME unchanged and advertise the group MIME on group sends.
-        request.addHeader(headerFactory.createAcceptHeader(mediaType, mediaSubtype));
+        // 群信封用 text/plain 承载，靠标记头区分；普通消息保持原 MIME
+        if (groupEnvelope) {
+            request.addHeader(headerFactory.createHeader(GroupProtocol.HEADER, GroupProtocol.HEADER_VALUE));
+            request.addHeader(headerFactory.createAcceptHeader("text", "plain"));
+        } else {
+            request.addHeader(headerFactory.createAcceptHeader(mediaType, mediaSubtype));
+        }
 
         // SIP 消息体统一使用 UTF-8，避免中文乱码
         ContentTypeHeader contentTypeHeader = headerFactory.createContentTypeHeader(mediaType, mediaSubtype);

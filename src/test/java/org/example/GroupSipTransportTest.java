@@ -85,13 +85,31 @@ public class GroupSipTransportTest {
         client.sendGroupEnvelope("101", envelope, (ok, detail) -> { });
         Request request = sent.get(0);
         assertTrue(SipVideoCallClient.isGroupMessage(request));
+        // miniSIPServer 会拒绝自定义 application 子类型（406），线上必须用通用 MIME + 标记头
         ContentTypeHeader type = (ContentTypeHeader) request.getHeader(ContentTypeHeader.NAME);
-        assertEquals(GroupProtocol.MEDIA_TYPE, type.getContentType() + "/" + type.getContentSubType());
+        assertEquals(GroupProtocol.WIRE_MEDIA_TYPE, type.getContentType() + "/" + type.getContentSubType());
+        assertNotNull("群信封必须带标记头", request.getHeader(GroupProtocol.HEADER));
         AcceptHeader accepted = (AcceptHeader) request.getHeader(AcceptHeader.NAME);
-        assertEquals(GroupProtocol.MEDIA_TYPE, accepted.getContentType() + "/" + accepted.getContentSubType());
+        assertEquals(GroupProtocol.WIRE_MEDIA_TYPE, accepted.getContentType() + "/" + accepted.getContentSubType());
         assertEquals("100", ((SipURI) ((FromHeader) request.getHeader(FromHeader.NAME)).getAddress().getURI()).getUser());
         assertArrayEquals(envelope.getBytes(StandardCharsets.UTF_8), request.getRawContent());
         assertEquals(5060, ((SipURI) request.getRequestURI()).getPort());
+    }
+
+    @Test public void groupEnvelopeIsDetectedAfterServerStripsMarkerHeader() throws Exception {
+        // miniSIPServer 转发 MESSAGE 时会剥离自定义头，接收端必须靠正文前缀兜底识别
+        String envelope = GroupProtocol.ENVELOPE_PREFIX + "TEXT\"}";
+        client.sendGroupEnvelope("101", envelope, (ok, detail) -> { });
+        Request request = sent.get(0);
+        request.removeHeader(GroupProtocol.HEADER);
+        assertTrue(SipVideoCallClient.isGroupMessage(request));
+    }
+
+    @Test public void plainTextIsNotMistakenForGroupEnvelope() throws Exception {
+        client.sendGroupEnvelope("101", "{\"text\":\"普通文字\"}", (ok, detail) -> { });
+        Request request = sent.get(0);
+        request.removeHeader(GroupProtocol.HEADER);
+        assertFalse(SipVideoCallClient.isGroupMessage(request));
     }
 
     @Test public void successIsSipAcceptanceAndCompletesOnlyOnce() throws Exception {
