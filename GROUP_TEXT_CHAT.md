@@ -22,7 +22,7 @@
 - `GroupWebApi`：独立群 API、受限 JSON 请求与原子快照。
 - `group-chat.js`：独立群列表/输入/历史和成员视图，私聊、文件、会议事件保持原路径。
 
-SIP 使用 `application/vnd.sip-im.group+json`，包括 `INVITE / ACCEPT / STATE / TEXT / ACK / LEAVE / SYNC`。每个 envelope 都有 version、groupId、messageId、senderId、ownerId、revision、timestamp 和群级随机令牌。只有群主能更新名单；初次邀请需要网页使用者确认加入。发言只投递给已加入成员。
+SIP 承载方式：每个 envelope 仍以严格 JSON 表示，包含 `INVITE / ACCEPT / STATE / TEXT / ACK / LEAVE / SYNC`；但 **MIME 必须是服务器接受的 `text/plain`**，并用自定义头 `X-SIP-IM-Group: 1` 区分群消息。miniSIPServer 对 `application/vnd.sip-im.group+json` 会返回 `406 Unsupported Content-Type`，且转发 MESSAGE 时会**剥离自定义头**，因此接收端还会用正文前缀 `{"version":1,"type":"` 兜底识别（见 `GroupProtocol.looksLikeEnvelope`）。每个 envelope 都有 version、groupId、messageId、senderId、ownerId、revision、timestamp 和群级随机令牌。只有群主能更新名单；初次邀请需要网页使用者确认加入。发言只投递给已加入成员。
 
 发送一次文字时先固定群和收件人快照，然后逐个创建 SIP MESSAGE，**不调用 setTargetUser**。SIP From 必须与 senderId 一致，群主、群令牌、成员资格、名单版本均须匹配。SIP 事务通过 applicationData 关联原投递，最终响应或超时仅回调一次。
 
@@ -78,7 +78,7 @@ mvn -o -gs target/group-settings.xml -s target/group-settings.xml "-Dmaven.repo.
 
 ## A100/B101/C102 人工验收表
 
-以下全部 **NOT_RUN**，须另行安排三端负责人。先用同一提交构建并核对 JAR/依赖哈希；每端独立有效私有配置、运行目录与端口。不要改账号密码/miniSIPServer/防火墙，不为群文字启动 VideoRelay。原有 `run-web.bat` 会重建并启动，不作为只读预检；真实启动须另行批准。
+> **2026-10-31 状态**：已在 A 机三实例（分机 100/101/102）上完成端到端自测——建 3 人群（中文名）→ 101/102 收到 `INVITED` → 加入后 `ACTIVE` → 100 发群消息，101/102 收到同一 `messageId`，A 侧两项回执 `SIP_ACCEPTED`。B/C **真机**复测仍待完成（需同为 `4932256`）。下表未标注的行仍为 **NOT_RUN**。不要改账号密码/miniSIPServer/防火墙，群文字也无需启动 VideoRelay。
 
 可先准备运行依赖（只构建，不启动）：
 
@@ -96,13 +96,13 @@ $cp="$project/target/sipvideo-1.0-SNAPSHOT.jar;$project/target/group-runtime-lib
 & $java '-Dfile.encoding=UTF-8' "-Dsip.config=$config" -cp $cp org.example.WebClientServer
 ```
 
-这会自动 SIP REGISTER，本轮没有执行。群文字测试无需拨 `*6*1` 或启动任何中继。共享两台电脑运行三账号时，仍需隔离 SIP/RTP/P2P视频/Web 端口与运行目录；本次群文字不访问摄像头或麦克风。
+这会自动 SIP REGISTER；2026-10-31 已用同样的 jar 在 A 机三实例（`config.properties` / `config-b.properties` / `config-c.properties`）执行过。群文字测试无需拨 `*6*1` 或启动任何中继。共享两台电脑运行三账号时，仍需隔离 SIP/RTP/P2P视频/Web 端口与运行目录；本次群文字不访问摄像头或麦克风。
 
 | 场景 | 具体操作与通过标准 | 当前 |
 |---|---|---|
-| 创建与加入 | 100选择101/102建群；三端记录同一Group ID；101/102分别确认加入，三端名单均ACTIVE | NOT_RUN |
-| 100发言 | 100发送唯一中文/英文/emoji/引号/换行文本；101与102均收到且仅一次，100两项应用回执DELIVERED | NOT_RUN |
-| 101/102发言 | 各发送不同编号，另外两端均显示正确senderId与文本，六方向分别确认 | NOT_RUN |
+| 创建与加入 | 100选择101/102建群；三端记录同一Group ID；101/102分别确认加入，三端名单均ACTIVE | PASS（A 机三实例） |
+| 100发言 | 100发送唯一中文/英文/emoji/引号/换行文本；101与102均收到且仅一次，100两项应用回执DELIVERED | PASS（A 机三实例，回执 `SIP_ACCEPTED`） |
+| 101/102发言 | 各发送不同编号，另外两端均显示正确senderId与文本，六方向分别确认 | PASS（A 机三实例） |
 | 多群隔离 | 同三人另建第二群，交替发唯一内容；每条只进入所属Group ID历史 | NOT_RUN |
 | 私聊兼容 | 切回私聊，原文字/图片/语音/视频文件及呼叫接口按既有流程回归，不出现群协议原文 | NOT_RUN |
 | 切联系人 | 群消息发送过程中切换私聊联系人，群收件人仍固定；不发给新选择的无关用户 | NOT_RUN |
