@@ -477,6 +477,8 @@ Test-Connection -ComputerName <B 机 IP> -Count 2
     miniSIPServer 返回 `406 Unsupported Content-Type` → 改用 `text/plain` + `X-SIP-IM-Group` 头
 16. **群消息被当普通文字**：服务器转发 `MESSAGE` 时会**剥离自定义头**，
     接收端只认头就会漏判 → 增加正文前缀 `{"version":1,"type":"` 兜底识别（`GroupProtocol.looksLikeEnvelope`）
+17. **C 机实时返听、静音麦克风无效**：系统默认录音设备是 Realtek 的「主声音捕获器」（即 Stereo Mix 环回），
+    采集的是扬声器输出，对端声音被采回去 → `AudioCapture` 按中英文名跳过环回设备；找不到真实麦克风时回退并告警
 
 ---
 

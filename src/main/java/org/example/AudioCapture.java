@@ -70,12 +70,15 @@ public class AudioCapture {
         }
         TargetDataLine line = (TargetDataLine) AudioSystem.getLine(info);
         line.open(format, 1600);
-        System.out.println("✓ 麦克风已启动（系统默认设备）");
+        System.err.println("⚠ 未找到可用麦克风，回退到系统默认录音设备（可能是环回设备，注意自听回声）");
         return line;
     }
 
-    private static boolean isLoopbackDevice(String name) {
+    /** 判断混音器是否为环回设备（采集的是扬声器输出，不是真实麦克风）。 */
+    static boolean isLoopbackDevice(String name) {
+        // Realtek 声卡在中文 Windows 上把 Stereo Mix 显示为「主声音捕获器」
         return name.contains("stereo mix") || name.contains("立体声混音")
+                || name.contains("主声音捕获器") || name.contains("主声音捕获")
                 || name.contains("loopback") || name.contains("what u hear")
                 || name.contains("wave out mix") || name.contains("waveout mix");
     }
