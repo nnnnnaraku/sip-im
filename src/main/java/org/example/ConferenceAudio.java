@@ -9,7 +9,6 @@ import java.util.Map;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.LockSupport;
 
 /**
  * 会议音频通道（客户端侧）：与点对点通话使用同一套 20ms / 16bit PCM 帧，
@@ -34,6 +33,8 @@ public class ConferenceAudio {
     private static final int PREBUFFER_FRAMES = 3;
     /** 队列上限，超过说明对端发送过快或本机卡顿，丢弃最旧的帧 */
     private static final int MAX_QUEUE_FRAMES = 10;
+    /** 缺帧超过该数量（约 100ms）就跳到最早可用的帧，避免永久等待 */
+    private static final int MAX_RESYNC_FRAMES = 5;
     private static final AudioFormat FORMAT = new AudioFormat(SAMPLE_RATE, 16, 1, true, false);
 
     private final ConferenceVideo channel;
@@ -129,23 +130,17 @@ public class ConferenceAudio {
 
     private void startPlayback() {
         Thread t = new Thread(() -> {
-            long next = System.nanoTime();
             long lastReport = System.currentTimeMillis();
             while (running) {
                 byte[] frame = mix();
                 SourceDataLine line = speaker;
                 if (line == null) return;
                 try {
+                    // 由 SourceDataLine 的阻塞写入控制 20ms 节奏：
+                    // 不要额外 sleep，否则会与声卡缓冲叠加，越播越慢。
                     line.write(frame, 0, frame.length);
                 } catch (Exception e) {
                     return;
-                }
-                next += 20_000_000L;
-                long wait = next - System.nanoTime();
-                if (wait > 0) {
-                    LockSupport.parkNanos(wait);
-                } else {
-                    next = System.nanoTime();
                 }
 
                 long now = System.currentTimeMillis();
@@ -190,7 +185,7 @@ public class ConferenceAudio {
     }
 
     /** 单个来源的抖动队列：按 20ms 时间片消费，丢包补静音。 */
-    private static final class PeerBuffer {
+    static final class PeerBuffer {
         private final TreeMap<Long, byte[]> frames = new TreeMap<>();
         private long lastSeq = -1;
         private long playSeq = -1;
@@ -208,14 +203,31 @@ public class ConferenceAudio {
         }
 
         synchronized byte[] next() {
-            if (playSeq < 0) return null;
-            // 长时间空档后重新对齐，避免队列里的新帧全部被判为“过期”
-            if (!frames.isEmpty() && frames.firstKey() > playSeq + 5) {
+            if (playSeq < 0) {
+                if (frames.size() < PREBUFFER_FRAMES) return null;
                 playSeq = frames.firstKey();
             }
+            // 丢弃已经播过或队列上限导致的旧帧
+            while (!frames.isEmpty() && frames.firstKey() < playSeq) {
+                frames.pollFirstEntry();
+            }
             byte[] frame = frames.remove(playSeq);
-            playSeq++;
-            return frame;
+            if (frame != null) {
+                playSeq++;
+                return frame;
+            }
+            if (frames.isEmpty()) {
+                // 欠载：不要推进 playSeq，否则下一帧到达时会被误判为“已播过”而永久静音
+                return null;
+            }
+            if (frames.firstKey() - playSeq > MAX_RESYNC_FRAMES) {
+                // 中间确实丢了较多帧，直接跳到最早可用的帧
+                playSeq = frames.firstKey();
+                frame = frames.remove(playSeq);
+                playSeq++;
+                return frame;
+            }
+            return null; // 短暂乱序：本时间片补静音，等缺失帧
         }
 
         /** 把 16 位序号展开成单调递增的 long，处理回绕。 */
