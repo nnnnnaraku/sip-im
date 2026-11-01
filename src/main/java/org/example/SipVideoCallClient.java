@@ -1146,6 +1146,7 @@ public class SipVideoCallClient implements SipListener {
         String recipient = targetUser;
         sendRawTo(recipient, text, "text", "plain", null);
         EventLog.log("MSG", "OUT", recipient, "TEXT:" + text.length());
+        ChatLog.DEFAULT.record("OUT", recipient, "TEXT", text);
         notifyMessage(recipient, text, true);
     }
 
@@ -1390,6 +1391,7 @@ public class SipVideoCallClient implements SipListener {
                 });
         System.out.println(typeName(type) + "分片已提交 SIP 发送（不代表对端完整接收），共 " + sent.getChunks() + " 片");
         EventLog.log("MSG", "OUT", recipient, type + ":" + sent.getSize());
+        ChatLog.DEFAULT.record("OUT", recipient, type, originalName);
         notifyFile(recipient, type, originalName, file.getAbsolutePath(), true);
     }
 
@@ -1427,6 +1429,7 @@ public class SipVideoCallClient implements SipListener {
             File out = saved.getPath().toFile();
             String type = result.getType();
             EventLog.log("MSG", "IN", peer, type + ":" + saved.getSize());
+            ChatLog.DEFAULT.record("IN", peer, type, saved.getOriginalName());
             notifyFile(peer, type, saved.getOriginalName(), out.getAbsolutePath(), false);
             System.out.println("[附件接收完成] " + saved.getStorageName() + " bytes=" + saved.getSize()
                     + " sha256=" + saved.getSha256());
@@ -1621,6 +1624,7 @@ public class SipVideoCallClient implements SipListener {
                     String from = (msgFrom != null) ? msgFrom.getAddress().toString() : "未知";
                     System.out.println("\n[收到消息] 来自 " + from + "：" + text);
                     EventLog.log("MSG", "IN", peer, "TEXT:" + text.length());
+                    ChatLog.DEFAULT.record("IN", peer, "TEXT", text);
                     notifyMessage(peer, text, false);
                 }
                 Response response = messageFactory.createResponse(200, request);

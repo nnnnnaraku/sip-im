@@ -55,6 +55,23 @@
   .empty { color: #94a3b8; padding: 18px; text-align: center; background: #fff; border-radius: 12px; font-size: 13px; }
   .warn { background: #fef2f2; color: #b91c1c; padding: 12px 16px; border-radius: 10px; font-size: 13px; margin-bottom: 14px; }
   .muted { color: #94a3b8; }
+  .filters {
+    display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+    background: #fff; padding: 12px 14px; border-radius: 12px;
+    box-shadow: 0 1px 3px rgba(15,23,42,.08); margin-bottom: 12px;
+  }
+  .filters input, .filters select {
+    padding: 8px 10px; border: 1px solid #cbd5e1; border-radius: 8px;
+    font-size: 13px; background: #fff; color: #0f172a;
+  }
+  .filters input { min-width: 170px; }
+  .filters button {
+    padding: 8px 16px; border: 0; border-radius: 8px; background: #2563eb;
+    color: #fff; font-size: 13px; cursor: pointer;
+  }
+  .filters button:hover { background: #1d4ed8; }
+  #q-info { font-size: 12.5px; color: #64748b; margin-left: auto; }
+  td.chat-text { white-space: pre-wrap; word-break: break-word; max-width: 480px; }
 </style>
 </head>
 <body>
@@ -120,8 +137,35 @@
     </table>
   </section>
 
+  <section>
+    <h2>聊天记录查询 <span class="muted" style="font-weight:400;font-size:12px">（本机私聊：文字 / 图片 / 语音 / 视频）</span></h2>
+    <div class="filters">
+      <input id="q-peer" placeholder="对端分机，如 101">
+      <input id="q-keyword" placeholder="内容关键字">
+      <select id="q-type">
+        <option value="">全部类型</option>
+        <option value="TEXT">文字</option>
+        <option value="IMG">图片</option>
+        <option value="VOICE">语音</option>
+        <option value="VIDEO">视频</option>
+      </select>
+      <select id="q-limit">
+        <option value="50">最近 50 条</option>
+        <option value="100" selected>最近 100 条</option>
+        <option value="200">最近 200 条</option>
+        <option value="500">最近 500 条</option>
+      </select>
+      <button id="q-btn">查询</button>
+      <span id="q-info"></span>
+    </div>
+    <table id="t-chat">
+      <thead><tr><th>时间</th><th>方向</th><th>对端</th><th>类型</th><th>内容</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
   <p class="muted" style="text-align:center;margin:26px 0;font-size:12px">
-    数据来源：分机/会议室来自 miniSIPServer；通话/消息统计来自本机 logs/events.tsv ｜ 每 5 秒自动刷新
+    数据来源：分机/会议室来自 miniSIPServer；通话/消息统计来自本机 logs/events.tsv；聊天记录来自本机 logs/chat.jsonl ｜ 每 5 秒自动刷新统计
   </p>
 </div>
 
@@ -131,9 +175,10 @@ const MSG_LABEL = { TEXT: "文字", IMG: "图片", VOICE: "语音", VIDEO: "视�
 
 function setText(id, v) { document.getElementById(id).textContent = v; }
 
-function rows(tbodyId, html) {
+function rows(tbodyId, html, cols) {
   const tb = document.querySelector("#" + tbodyId + " tbody");
-  tb.innerHTML = html || '<tr><td colspan="6" class="muted" style="text-align:center">暂无数据</td></tr>';
+  const span = cols || 6;
+  tb.innerHTML = html || '<tr><td colspan="' + span + '" class="muted" style="text-align:center">暂无数据</td></tr>';
 }
 
 function esc(s) {
@@ -187,8 +232,43 @@ async function refresh() {
          <td>${esc(c.peer)}</td><td>${c.duration}</td></tr>`).join(""));
 }
 
+async function queryChat() {
+  const params = new URLSearchParams();
+  const peer = document.getElementById("q-peer").value.trim();
+  const keyword = document.getElementById("q-keyword").value.trim();
+  const type = document.getElementById("q-type").value;
+  const limit = document.getElementById("q-limit").value;
+  if (peer) params.set("peer", peer);
+  if (keyword) params.set("keyword", keyword);
+  if (type) params.set("type", type);
+  params.set("limit", limit);
+
+  try {
+    const r = await fetch("/api/chat?" + params.toString(), { cache: "no-store" });
+    if (r.status === 401) { location.href = "/"; return; }
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const d = await r.json();
+    setText("q-info", "共 " + d.total + " 条，显示 " + d.returned + " 条");
+    rows("t-chat", (d.records || []).map(c =>
+      `<tr><td>${esc(c.time)}</td>
+           <td><span class="badge ${c.direction === "OUT" ? "b-out" : "b-in"}">${c.direction === "OUT" ? "发出" : "收到"}</span></td>
+           <td><b>${esc(c.peer)}</b></td>
+           <td>${esc(MSG_LABEL[c.type] || c.type)}</td>
+           <td class="chat-text">${esc(c.text)}</td></tr>`).join(""), 5);
+  } catch (e) {
+    setText("q-info", "查询失败：" + e.message);
+  }
+}
+
+document.getElementById("q-btn").addEventListener("click", queryChat);
+["q-peer", "q-keyword"].forEach(id =>
+  document.getElementById(id).addEventListener("keydown", e => { if (e.key === "Enter") queryChat(); }));
+document.getElementById("q-type").addEventListener("change", queryChat);
+document.getElementById("q-limit").addEventListener("change", queryChat);
+
 refresh();
 setInterval(refresh, 5000);
+queryChat();
 </script>
 </body>
 </html>

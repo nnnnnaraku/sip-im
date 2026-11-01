@@ -59,12 +59,16 @@ public class AdminServer {
     /** 客户端事件日志（由 SipVideoCallClient 写入） */
     private static final Path EVENT_FILE = Paths.get("logs", "events.tsv");
 
+    /** 本机聊天记录（由 SipVideoCallClient 写入） */
+    private static final ChatLog CHAT = ChatLog.DEFAULT;
+
     public static void main(String[] args) throws Exception {
         HttpServer server = HttpServer.create(new InetSocketAddress(PORT), 0);
         server.createContext("/", AdminServer::handleRoot);
         server.createContext("/login", AdminServer::handleLogin);
         server.createContext("/logout", AdminServer::handleLogout);
         server.createContext("/api/summary", AdminServer::handleSummary);
+        server.createContext("/api/chat", AdminServer::handleChat);
         server.setExecutor(java.util.concurrent.Executors.newFixedThreadPool(4));
         server.start();
 
@@ -140,6 +144,33 @@ public class AdminServer {
     }
 
     // ---------------- 汇总数据 ----------------
+
+    private static void handleChat(HttpExchange ex) {
+        try {
+            if (!isAuthed(ex)) {
+                sendText(ex, 401, "{\"error\":\"unauthorized\"}");
+                return;
+            }
+            String q = ex.getRequestURI().getRawQuery();
+            String peer = param(q, "peer");
+            String keyword = param(q, "keyword");
+            String type = param(q, "type");
+            int limit = parseInt(param(q, "limit"), 100);
+
+            ChatLog.Result result = CHAT.query(peer, keyword, type, limit);
+            JsonObject out = new JsonObject();
+            out.addProperty("total", result.total);
+            out.addProperty("returned", result.records.size());
+            JsonArray records = new JsonArray();
+            for (JsonObject record : result.records) {
+                records.add(record);
+            }
+            out.add("records", records);
+            sendJson(ex, 200, out);
+        } catch (Exception e) {
+            sendJson(ex, 500, err("聊天记录查询失败"));
+        }
+    }
 
     private static JsonObject buildSummary() {
         JsonObject out = new JsonObject();
@@ -342,6 +373,33 @@ public class AdminServer {
                 os.write(body);
             }
         } catch (Exception ignore) {
+        }
+    }
+
+    private static void sendJson(HttpExchange ex, int code, JsonObject json) {
+        try {
+            byte[] body = json.toString().getBytes(StandardCharsets.UTF_8);
+            ex.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
+            ex.sendResponseHeaders(code, body.length);
+            try (OutputStream os = ex.getResponseBody()) {
+                os.write(body);
+            }
+        } catch (Exception ignore) {
+        }
+    }
+
+    private static JsonObject err(String message) {
+        JsonObject o = new JsonObject();
+        o.addProperty("error", message);
+        return o;
+    }
+
+    private static int parseInt(String s, int def) {
+        if (s == null) return def;
+        try {
+            return Integer.parseInt(s.trim());
+        } catch (NumberFormatException e) {
+            return def;
         }
     }
 

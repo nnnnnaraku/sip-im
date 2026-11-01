@@ -175,7 +175,7 @@
 | ② 视频消息 | 🟢 **完成** | 发送视频文件，接收端可播放 |
 | 多人文字群聊 | 🟢 **完成**（三端实测通过） | 独立群 ID、邀请确认、成员名单、应用回执、失败重试和群/私聊隔离；详见 [群文字说明](GROUP_TEXT_CHAT.md) |
 | ③ 群聊（多方音视频） | 🟢 **完成** | 拨 **`*6*1`** 入会：**音频与视频都经 `VideoRelay` 扇出**，客户端抖动缓冲 + 混音播放，不回传自己；网页**多路并排显示** |
-| ④ 后台管理与查询统计 | 🟢 **完成** | Web 仪表盘：分机在线状态、会议室、通话记录统计、消息统计 |
+| ④ 后台管理与查询统计 | 🟢 **完成** | Web 仪表盘：分机在线状态、会议室、通话记录统计、消息统计、**聊天记录查询**（按对端/关键字/类型过滤） |
 
 ### 已交付的三种运行形态
 
@@ -209,6 +209,7 @@ sipvideo/
     │   ├── AdminServer.java           ★ 后台管理端：登录 + API + 仪表盘
     │   ├── MssClient.java             miniSIPServer Web 接口客户端（会话复用）
     │   ├── EventLog.java              事件日志（通话/消息，供后台统计）
+    │   ├── ChatLog.java               本机聊天记录（供后台查询）
     │   ├── AudioCapture.java          麦克风采集
     │   ├── VoiceIO.java               语音录制(WAV)/播放 + 可停止录音器
     │   ├── PCMUEncoder.java           PCM ⇄ G.711 μ-law 编解码
@@ -236,7 +237,7 @@ sipvideo/
 |---|---|
 | `SipVideoCallClient` | 唯一的 SIP 引擎：注册/呼叫/接听/挂断、音频与视频 RTP、文字与文件消息、对外暴露 `Ui` 回调供网页层订阅事件 |
 | `WebClientServer` | 起 HTTP 服务，把浏览器操作转成对引擎的调用；用 SSE 把消息/文件/通话状态/视频帧推给网页 |
-| `AdminServer` | 管理员口令登录；读 miniSIPServer 的在线分机与会议室；读 `logs/events.tsv` 汇总通话与消息统计 |
+| `AdminServer` | 管理员口令登录；读 miniSIPServer 的在线分机与会议室；读 `logs/events.tsv` 汇总通话与消息统计；读 `logs/chat.jsonl` 查询本机聊天记录 |
 | `VideoRelay` | 会议媒体中继：按房间把 JPEG 帧与 20ms PCM 音频帧扇出给其他参与者（UDP 9100） |
 | `ConferenceVideo` | 客户端会议通道：采集/发送视频与音频；接收多人画面和音频帧 |
 | `ConferenceAudio` | 会议音频：采集→中继；多路接收→60ms 抖动缓冲→混音→播放（不回传自己） |
@@ -302,6 +303,8 @@ powershell -ExecutionPolicy Bypass -File setup-mss.ps1 -ServerHost 127.0.0.1 -Se
 ### 7.3 后台管理端（任选一台）
 
 双击 `run-admin.bat` → 浏览器打开 **http://localhost:8090/** → 口令 `1234`
+
+页面底部「聊天记录查询」可按对端分机、内容关键字、消息类型筛选本机私聊记录（数据来自 `logs/chat.jsonl`）。
 
 ### 7.4 开工自检（每次开始前跑一遍）
 
@@ -419,6 +422,7 @@ Test-Connection -ComputerName <B 机 IP> -Count 2
 | 群聊音视频不经过 SIP/SDP | 由应用层中继扇出（SIP 只负责入会信令） | 手机 Linphone 无法加入该会议媒体 |
 | 会议音频版本绑定 | 音频帧格式为本项目自定义 | A/B/C 三端必须同一版本，旧客户端与新客户端互相听不到 |
 | 群消息的 MIME 受限 | miniSIPServer 对自定义 `application/*+json` 返回 `406`，转发时还会**剥离自定义头** | 群信封统一用 `text/plain`，接收端靠正文前缀识别；群聊只在**同版本**客户端间互通 |
+| 后台聊天记录只含本机私聊 | 记录写入本机 `logs/chat.jsonl`，不跨机汇总；群聊记录仍保留在群面板 | 验收演示时在 A 机查询 A 的私聊记录即可 |
 
 ---
 
