@@ -342,6 +342,9 @@ public class SipVideoCallClient implements SipListener {
     }
 
     public void init() throws Exception {
+        // sip.local.ip=auto 时自动选择本机网卡；部署到其它电脑不需要手工填 IP
+        localIp = LocalIp.resolve(localIp, serverIp, serverPort);
+
         SipFactory sipFactory = SipFactory.getInstance();
         sipFactory.setPathName("gov.nist");
 
@@ -372,7 +375,38 @@ public class SipVideoCallClient implements SipListener {
 
         // 启动定时重新注册，避免 Expires 到期后失去联系
         startReRegister();
+        startRegisterWatchdog();
         startFileCleanup();
+    }
+
+    /**
+     * 服务器尚未启动时持续重试注册。
+     * 网页界面会先启动，服务器上线后客户端自动连上，不需要重启。
+     */
+    private void startRegisterWatchdog() {
+        Thread t = new Thread(() -> {
+            int attempts = 0;
+            while (!Thread.currentThread().isInterrupted()) {
+                try {
+                    Thread.sleep(5000);
+                    if (isRegistered) {
+                        attempts = 0;
+                        continue;
+                    }
+                    attempts++;
+                    if (attempts == 1 || attempts % 12 == 0) {
+                        System.out.println("[等待服务器] 尚未注册，正在自动重试 " + serverIp + ":" + serverPort + " ...");
+                    }
+                    register();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } catch (Exception e) {
+                    // 服务器未启动或网络未就绪时静默重试
+                }
+            }
+        }, "RegisterWatchdog");
+        t.setDaemon(true);
+        t.start();
     }
 
     /**
@@ -1826,17 +1860,8 @@ public class SipVideoCallClient implements SipListener {
             }
             if (tx != null && tx.getRequest() != null
                     && Request.REGISTER.equals(tx.getRequest().getMethod())) {
-                System.out.println("[注册超时] 30 秒后自动重试注册...");
-                Thread retry = new Thread(() -> {
-                    try {
-                        Thread.sleep(30000);
-                        register();
-                    } catch (Exception e) {
-                        System.err.println("重试注册失败: " + e.getMessage());
-                    }
-                }, "RegisterRetry");
-                retry.setDaemon(true);
-                retry.start();
+                isRegistered = false;
+                System.out.println("[注册超时] 将自动重试注册...");
             }
         } catch (Exception e) {
             // 拿不到事务信息时忽略，不影响主流程

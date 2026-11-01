@@ -210,6 +210,7 @@ sipvideo/
     │   ├── MssClient.java             miniSIPServer Web 接口客户端（会话复用）
     │   ├── EventLog.java              事件日志（通话/消息，供后台统计）
     │   ├── ChatLog.java               本机聊天记录（供后台查询）
+    │   ├── LocalIp.java               本机 IPv4 自动检测（sip.local.ip=auto）
     │   ├── AudioCapture.java          麦克风采集
     │   ├── VoiceIO.java               语音录制(WAV)/播放 + 可停止录音器
     │   ├── PCMUEncoder.java           PCM ⇄ G.711 μ-law 编解码
@@ -294,11 +295,14 @@ powershell -ExecutionPolicy Bypass -File setup-mss.ps1 -ServerHost 127.0.0.1 -Se
    copy config.properties.example config.properties
    ```
    **模板里的 IP 是占位示例，必须换成你自己的**：
-   - `sip.local.ip` = **本机当前 IP**（`ipconfig` 查），不能填 `127.0.0.1`
+   - `sip.local.ip` = `auto` 即可（自动检测本机网卡；也可写死本机当前 IP，不能填 `127.0.0.1`）
    - `sip.server.ip` = 跑 miniSIPServer 那台机的 IP
    - `sip.username` = 本机分机号；`sip.target.user` = 对端分机号
 2. 双击 `run-web.bat`，等待出现 `✓ 注册成功!`
 3. 浏览器打开 **http://localhost:8081/**
+
+> 客户端可以**先于服务器启动**：网页会先打开，显示「未注册」；后台每 5 秒自动重试注册，
+> 服务器上线后自动变成「已注册」，**不需要重启客户端**。
 
 ### 7.3 后台管理端（任选一台）
 
@@ -309,7 +313,7 @@ powershell -ExecutionPolicy Bypass -File setup-mss.ps1 -ServerHost 127.0.0.1 -Se
 ### 7.4 开工自检（每次开始前跑一遍）
 
 ```powershell
-# 1) 本机 IP —— 要与 config.properties 的 sip.local.ip 一致
+# 1) 本机 IP —— 若 sip.local.ip=auto，看启动日志里的「已自动检测本机 IP」
 Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '169.254*' -and $_.IPAddress -ne '127.0.0.1' } | Select-Object IPAddress,InterfaceAlias
 
 # 2) 服务器端口是否在监听（在 A 机执行）
@@ -324,8 +328,8 @@ Test-Connection -ComputerName <B 机 IP> -Count 2
 
 | 谁的 IP 变了 | 要改的配置 |
 |---|---|
-| **A 机 IP 变** | A 的 `sip.local.ip`、`sip.server.ip`；**以及 B 的** `sip.server.ip`、`mss.web.host` |
-| **B 机 IP 变** | 只需改 B 的 `sip.local.ip` |
+| **A 机 IP 变** | A 的 `sip.local.ip`（若写死）；B/C 的 `sip.server.ip`、`mss.web.host`、`video.relay.host` |
+| **B/C 机 IP 变** | `sip.local.ip=auto` 时无需改，重启客户端即可 |
 
 > ⚠️ `sip.local.ip` 填错的表现：能注册、能接通，但**没声音、没画面**。
 
@@ -333,6 +337,19 @@ Test-Connection -ComputerName <B 机 IP> -Count 2
 
 两台机器都执行 `git pull`，并用 `git log --oneline -1` 确认两边是**同一个提交**。
 （用了旧代码会出现：没有联系人、录音只能 5 秒、挂断后画面卡住等已修复的问题。）
+
+### 7.7 C 机软件包（部署到老师电脑）
+
+本地生成的压缩包：`dist/sipvideo-C机客户端.zip`（已内置 Java 8 运行环境，约 44 MB）。
+
+1. 解压到任意目录（必须整个文件夹一起解压）。
+2. 双击 `start-c.bat`。
+3. 浏览器自动打开 `http://127.0.0.1:8081/`；访问令牌已自动复制到剪贴板，登录页按 `Ctrl+V` 粘贴。
+4. 如果 A 机服务还没启动，页面会显示「未注册」；**保持客户端窗口**，A 机启动后每 5 秒自动重试并连上，无需重启。
+
+包内 `config.properties` 已固定：分机 `102`、服务器 `10.122.210.64`、`sip.local.ip=auto`。
+如果 A 机 IP 变化，只需改该文件中的 `sip.server.ip`、`mss.web.host`、`video.relay.host`。
+
 
 ---
 
@@ -487,6 +504,8 @@ Test-Connection -ComputerName <B 机 IP> -Count 2
     声卡消费略快于对端发送，积少成多后新到的帧全被判为「已播过」而丢弃
     → 欠载时不推进 `playSeq`，缺帧超过 100ms 才重同步；播放节奏交给 `SourceDataLine.write` 阻塞控制，
     不再额外 `sleep`（避免与声卡缓冲叠加导致越播越慢）
+19. **部署到其它电脑要手填本机 IP、且服务器没起就连不上**：`sip.local.ip=auto` 自动选择与服务器
+    同子网的物理网卡；未注册时每 5 秒自动重试，网页先启动，服务器上线后无需重启客户端即可注册成功
 
 ---
 

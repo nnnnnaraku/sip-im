@@ -1,5 +1,6 @@
 # ---- Maven 构建产物 ----
 target/
+dist/
 pom.xml.tag
 pom.xml.releaseBackup
 pom.xml.versionsBackup

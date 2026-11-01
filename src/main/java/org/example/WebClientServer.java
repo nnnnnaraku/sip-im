@@ -104,13 +104,25 @@ public class WebClientServer {
 
         // 2) 再启动 SIP 引擎（放到后台线程，避免阻塞 Web 服务）
         Thread engine = new Thread(() -> {
-            try {
-                sip = new SipVideoCallClient(FILES);
-                sip.setUi(new UiBridge());
-                sip.setGroupMessageHandler(GROUPS::receive);
-                sip.init();
-            } catch (Exception e) {
-                System.err.println("SIP 引擎启动失败，请检查本机 SIP 配置及诊断日志。");
+            while (!Thread.currentThread().isInterrupted()) {
+                SipVideoCallClient client = new SipVideoCallClient(FILES);
+                client.setUi(new UiBridge());
+                client.setGroupMessageHandler(GROUPS::receive);
+                sip = client;
+                try {
+                    client.init();
+                    return;
+                } catch (Exception e) {
+                    sip = null;
+                    try { client.shutdown(); } catch (Exception ignore) { }
+                    System.err.println("SIP 引擎启动失败（" + e.getMessage() + "），5 秒后自动重试...");
+                    try {
+                        Thread.sleep(5000);
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
             }
         }, "SipEngine");
         engine.setDaemon(true);
