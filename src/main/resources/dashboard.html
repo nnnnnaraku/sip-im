@@ -138,9 +138,9 @@
   </section>
 
   <section>
-    <h2>聊天记录查询 <span class="muted" style="font-weight:400;font-size:12px">（本机私聊：文字 / 图片 / 语音 / 视频）</span></h2>
+    <h2>聊天记录查询 <span class="muted" style="font-weight:400;font-size:12px">（本机聊天：私聊 + 群聊文字）</span></h2>
     <div class="filters">
-      <input id="q-peer" placeholder="对端分机，如 101">
+      <input id="q-peer" placeholder="对端分机 / 群名，如 101">
       <input id="q-keyword" placeholder="内容关键字">
       <select id="q-type">
         <option value="">全部类型</option>
@@ -148,6 +148,7 @@
         <option value="IMG">图片</option>
         <option value="VOICE">语音</option>
         <option value="VIDEO">视频</option>
+        <option value="GROUP">群聊</option>
       </select>
       <select id="q-limit">
         <option value="50">最近 50 条</option>
@@ -171,7 +172,7 @@
 
 <script>
 const STATE_TEXT = { "在线": "b-on", "离线": "b-off", "通话中": "b-busy", "振铃": "b-ring" };
-const MSG_LABEL = { TEXT: "文字", IMG: "图片", VOICE: "语音", VIDEO: "视频" };
+const MSG_LABEL = { TEXT: "文字", IMG: "图片", VOICE: "语音", VIDEO: "视频", GROUP: "群聊" };
 
 function setText(id, v) { document.getElementById(id).textContent = v; }
 

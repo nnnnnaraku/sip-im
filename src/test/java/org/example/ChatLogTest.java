@@ -83,6 +83,17 @@ public class ChatLogTest {
     }
 
     @Test
+    public void groupTextUsesGroupPeerAndGroupType() {
+        log.record("IN", "群:课程小组", "GROUP", "101：大家好");
+        log.record("OUT", "群:课程小组", "GROUP", "明天见");
+
+        ChatLog.Result r = log.query("群:课程", null, "GROUP", 100);
+        assertEquals(2, r.total);
+        assertEquals("GROUP", r.records.get(0).get("type").getAsString());
+        assertTrue(r.records.get(0).get("peer").getAsString().startsWith("群:"));
+    }
+
+    @Test
     public void missingFileReturnsEmptyResult() {
         ChatLog missing = new ChatLog(tmp.getRoot().toPath().resolve("none").resolve("chat.jsonl"));
         ChatLog.Result r = missing.query(null, null, null, 100);

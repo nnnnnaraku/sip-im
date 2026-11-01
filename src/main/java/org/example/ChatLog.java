@@ -16,11 +16,11 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * 本机聊天记录：把私聊文字与文件消息追加写入 logs/chat.jsonl，供后台管理端查询。
+ * 本机聊天记录：把私聊文字/文件消息与群聊文字追加写入 logs/chat.jsonl，供后台管理端查询。
  *
  * <p>每行一个 JSON 对象：{@code {time, direction, peer, type, text}}。
- * 只记录本机收发的消息，不做跨机汇总；群聊记录仍保留在群面板内。
- * 写文件失败绝不影响通信。
+ * 群聊记录的 peer 为「群:群名」，收到的群文字在内容前标注发送者。
+ * 只记录本机收发的消息，不做跨机汇总。写文件失败绝不影响通信。
  */
 public final class ChatLog {
 
@@ -35,7 +35,7 @@ public final class ChatLog {
         this.file = file;
     }
 
-    /** 追加一条聊天记录；direction 为 OUT/IN，type 为 TEXT/IMG/VOICE/VIDEO。 */
+    /** 追加一条聊天记录；direction 为 OUT/IN，type 为 TEXT/IMG/VOICE/VIDEO/GROUP。 */
     public synchronized void record(String direction, String peer, String type, String text) {
         try {
             if (file.getParent() != null) {

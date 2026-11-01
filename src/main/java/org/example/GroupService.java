@@ -96,6 +96,7 @@ public final class GroupService {
         String checkedText = GroupProtocol.text(text);
         List<Job> jobs = new ArrayList<>();
         String id;
+        String groupName;
         synchronized (lock) {
             Group group = require(groupId);
             requireActive(group);
@@ -108,8 +109,10 @@ public final class GroupService {
             group.messages.put(message.messageId, new Group.Text(message, true, operation.deliveries));
             group.seen.put(message.messageId, fingerprint(message));
             id = message.messageId;
+            groupName = group.name;
         }
         publish(jobs);
+        ChatLog.DEFAULT.record("OUT", "群:" + groupName, "GROUP", checkedText);
         return id;
     }
 
@@ -184,6 +187,8 @@ public final class GroupService {
         List<Job> jobs = new ArrayList<>();
         int status = 200;
         boolean changed = false;
+        String chatPeer = null;
+        String chatText = null;
         synchronized (lock) {
             Group group = groups.get(message.groupId);
             try {
@@ -237,6 +242,8 @@ public final class GroupService {
                             if (group.messages.size() >= MAX_MESSAGES) reject(507, "HISTORY_LIMIT");
                             group.messages.put(message.messageId, new Group.Text(message, false, Collections.emptyMap()));
                             group.seen.put(message.messageId, fingerprint(message));
+                            chatPeer = "群:" + group.name;
+                            chatText = message.senderId + "：" + message.text;
                             changed = true;
                         }
                     } else if ("ACCEPT".equals(message.type)) {
@@ -282,6 +289,7 @@ public final class GroupService {
         }
         if (changed) changed();
         dispatch(jobs);
+        if (chatPeer != null) ChatLog.DEFAULT.record("IN", chatPeer, "GROUP", chatText);
         return status;
     }
 
