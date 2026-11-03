@@ -347,7 +347,7 @@ Test-Connection -ComputerName <B 机 IP> -Count 2
 3. 浏览器自动打开 `http://127.0.0.1:8081/`；访问令牌已自动复制到剪贴板，登录页按 `Ctrl+V` 粘贴。
 4. 如果 A 机服务还没启动，页面会显示「未注册」；**保持客户端窗口**，A 机启动后每 5 秒自动重试并连上，无需重启。
 
-包内 `config.properties` 已固定：分机 `102`、服务器 `10.122.210.64`、`sip.local.ip=auto`。
+包内 `config.properties` 已固定：分机 `102`、服务器地址按生成时的 A 机 IP 写入、`sip.local.ip=auto`。
 如果 A 机 IP 变化，只需改该文件中的 `sip.server.ip`、`mss.web.host`、`video.relay.host`。
 
 
